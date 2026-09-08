@@ -1,0 +1,11 @@
+[project]
+name = "grok-remote-bridge"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.141.1",
+    "python-multipart>=0.0.32",
+    "uvicorn[standard]>=0.52.3",
+    "websockets>=17.0.1",
+]

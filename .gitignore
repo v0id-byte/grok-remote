@@ -1,0 +1,25 @@
+# --- python / bridge runtime ---
+bridge/.venv/
+bridge/__pycache__/
+bridge/**/__pycache__/
+*.pyc
+
+# --- runtime state (never commit: holds device secrets + permission payloads) ---
+bridge.db
+bridge/bridge.db
+uploads/
+bridge/uploads/
+
+# --- logs (may contain paths, prompts, error detail) ---
+*.log
+
+# --- macOS / Xcode ---
+.DS_Store
+ios/GrokRemote.xcodeproj/xcuserdata/
+ios/GrokRemote.xcodeproj/project.xcworkspace/xcuserdata/
+ios/build/
+DerivedData/
+
+# --- local secrets, should any be introduced later ---
+ios/Secrets.xcconfig
+.env

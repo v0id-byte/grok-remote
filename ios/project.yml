@@ -1,0 +1,25 @@
+name: GrokRemote
+options:
+  bundleIdPrefix: com.v0id
+  deploymentTarget:
+    iOS: "17.0"
+settings:
+  MARKETING_VERSION: "0.1.0"
+  CURRENT_PROJECT_VERSION: "1"
+targets:
+  GrokRemote:
+    type: application
+    platform: iOS
+    sources:
+      - path: GrokRemote
+    info:
+      path: GrokRemote/Info.plist
+      properties:
+        UILaunchScreen: {}
+        NSCameraUsageDescription: "用于扫描配对二维码"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.v0id.grokremote
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1"
+        DEVELOPMENT_TEAM: ""
