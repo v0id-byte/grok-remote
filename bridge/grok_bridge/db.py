@@ -130,22 +130,6 @@ class Store:
             )
         return session_id
 
-    def rotate_grok_session_id(self, session_id: str) -> str:
-        """Grok's session lock can get stuck after a SIGTERM-cancelled turn
-        (confirmed empirically: 'Session ID ... is already in use' even once
-        the process is dead and the .lock file removed). Rather than leaving
-        the Bridge session permanently unusable, give it a fresh grok-side
-        session id -- the Bridge-facing `id` (used by the app/URLs) doesn't
-        change, only what gets passed to `grok -s`. Costs that session's
-        grok-side conversation continuity from before the cancel point."""
-        new_grok_id = str(uuid.uuid4())
-        with self._conn() as conn:
-            conn.execute(
-                "UPDATE sessions SET grok_session_id = ? WHERE id = ?",
-                (new_grok_id, session_id),
-            )
-        return new_grok_id
-
     def touch_session(self, session_id: str) -> None:
         with self._conn() as conn:
             conn.execute(

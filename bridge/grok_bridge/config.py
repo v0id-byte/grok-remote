@@ -73,6 +73,54 @@ ALLOWED_UPLOAD_EXTENSIONS = {".png", ".jpg", ".jpeg", ".pdf", ".txt", ".md", ".j
 DEFAULT_MODEL = "qwen3.8-27b-uncensored"
 DEFAULT_REASONING_EFFORT = "high"
 
+# --- ACP agent process management (plan v2 §1.1) -----------------------------
+#
+# One `grok agent stdio` process per Bridge session. cwd is a session/new
+# parameter in ACP mode (unlike the old `grok -p --cwd`), so per-session
+# processes map 1:1 onto sessions.cwd and a crash affects one conversation.
+
+# Reap an idle agent after this long. Safe because grok persists its own
+# session to disk and session/load resumes losslessly -- verified by the Phase 0
+# spike, which restored context across a process restart.
+ACP_IDLE_TTL_SECONDS = 900          # 15 minutes
+ACP_REAPER_INTERVAL_SECONDS = 60
+
+# Only IDLE agents are ever reaped. A tool that has been running for a long
+# time without producing output is not idle, and when every slot is busy the
+# next request is refused rather than something in flight being killed.
+ACP_MAX_LIVE_AGENTS = 6
+
+ACP_REQUEST_TIMEOUT_SECONDS = 120.0   # ordinary RPCs (initialize, set_model, ...)
+ACP_PROMPT_TIMEOUT_SECONDS = 1800.0   # a turn may legitimately run for a while
+ACP_STARTUP_TIMEOUT_SECONDS = 90.0
+ACP_STDERR_RING_BYTES = 16384         # bounded; never forwarded verbatim to a client
+
+# --- sandbox: the ONLY non-bypassable security boundary (plan v2 §0.6c) ------
+#
+# The Phase 0 spike established that `grok agent stdio` accepts neither --allow
+# nor --deny (the flag is rejected outright), so the permission-rule engine that
+# guarded the old `grok -p` path does not exist here, and grok never delegates
+# approval to the ACP client either. What remains is grok's OS-level sandbox:
+# applied to the whole process at startup via Seatbelt, inherited by child
+# processes, and irreversible -- "the model cannot convince the agent to relax
+# restrictions at runtime".
+SANDBOX_PROFILE_NAME = "grok-remote"
+SANDBOX_PATH = HOME / ".grok" / "sandbox.toml"
+SANDBOX_EVENTS_PATH = HOME / ".grok" / "sandbox-events.jsonl"
+
+# Paths the agent may not read OR write. grok's built-in profiles only
+# write-protect these; reading is what leaks a key, so they are denied outright.
+SANDBOX_DENY_PATHS = [
+    "~/.ssh", "~/.aws", "~/.gnupg", "~/.grok/auth",
+    "~/Library/Keychains", "~/.config",
+]
+
+# grok is fail-OPEN: if the sandbox cannot be applied it logs a warning and
+# runs unconfined. Since this is our only boundary, the Bridge is fail-CLOSED --
+# it verifies the profile actually took effect and refuses to serve otherwise.
+# Set GROK_BRIDGE_ALLOW_UNSANDBOXED=1 to override (local development only).
+SANDBOX_REQUIRED = os.environ.get("GROK_BRIDGE_ALLOW_UNSANDBOXED", "") != "1"
+
 # --- pairing / auth hardening (plan v2 §0.2) ---------------------------------
 #
 # Cloudflare Access was removed (see plan v2 §0.1): an Access Service Token is a

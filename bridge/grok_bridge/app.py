@@ -15,6 +15,8 @@ to redeem (plan v2 ss0.2).
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import re
 import subprocess
@@ -35,14 +37,27 @@ from fastapi import (
 from fastapi.responses import JSONResponse
 
 from . import config
-from .agent_manager import AgentManager
+from .acp import AgentBusy, AgentUnavailable
 from .db import Store
+from .sandbox import SandboxNotEnforced
 from .security import InvalidCwd, validate_cwd
+from .session_manager import AcpSessionManager, AgentCapacity
 
-app = FastAPI(title="grok-remote-bridge")
 store = Store()
-agents = AgentManager()
+agents = AcpSessionManager()
 START_TIME = time.time()
+
+
+@contextlib.asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    await agents.start()
+    try:
+        yield
+    finally:
+        await agents.shutdown()
+
+
+app = FastAPI(title="grok-remote-bridge", lifespan=_lifespan)
 log = logging.getLogger("grok_bridge.auth")
 
 # Drop unredeemed-but-expired pairing tokens left over from before the TTL
@@ -110,7 +125,7 @@ def health() -> dict[str, Any]:
     return {
         "status": "ok",
         "grok_reachable": grok_reachable,
-        "active_jobs": len(agents._running_procs),
+        "active_agents": agents.live_count,
         "uptime_s": round(time.time() - START_TIME, 1),
         "auth_failures": AUTH_FAIL_COUNT,
         "pairing_open": store.has_redeemable_pairing_token(),
@@ -245,6 +260,13 @@ async def upload(file: UploadFile, request: Request,
 
 @app.websocket("/v1/chat")
 async def chat(ws: WebSocket) -> None:
+    """One turn per connection (the v1 shape the current iOS app speaks).
+
+    Underneath it is now a resident ACP agent rather than a per-turn `grok -p`,
+    so cancelling no longer destroys conversation continuity. The socket-per-turn
+    protocol itself is what plan v2 §2.2 replaces with /v2/chat; the app is
+    migrated there before this endpoint is retired.
+    """
     await ws.accept()
     try:
         first = await ws.receive_json()
@@ -258,7 +280,7 @@ async def chat(ws: WebSocket) -> None:
         # Same throttling as the REST path -- the WebSocket must not be a way to
         # brute-force tokens without being counted. (v2 moves this check to the
         # upgrade's Authorization header so an unauthenticated socket is never
-        # accepted in the first place; plan v2 ss2.2.)
+        # accepted in the first place; plan v2 §2.2.)
         _note_auth_failure(_client_ip(ws), "invalid device token (ws)")
         await ws.close(code=4401)
         return
@@ -273,58 +295,136 @@ async def chat(ws: WebSocket) -> None:
     store.add_message_preview(session_id, "user", first.get("text", ""))
     store.touch_session(session_id)
 
-    cancel_requested = False
+    blocks = _prompt_blocks(first.get("text", ""), first.get("attachments"))
+    queue = agents.attach(session_id)
 
-    async def _watch_for_cancel():
-        nonlocal cancel_requested
+    turn = asyncio.create_task(agents.prompt(
+        session_id=session_id,
+        grok_session_id=session["grok_session_id"],
+        cwd=Path(session["cwd"]),
+        blocks=blocks,
+        model=first.get("model"),
+        reasoning_effort=first.get("reasoningEffort"),
+    ))
+
+    async def _watch_for_cancel() -> None:
         try:
             while True:
                 msg = await ws.receive_json()
                 if msg.get("type") == "cancel":
-                    cancel_requested = True
                     await agents.cancel(session_id)
                     return
-        except WebSocketDisconnect:
-            cancel_requested = True
+        except (WebSocketDisconnect, RuntimeError, ValueError):
+            # A dropped socket is a cancellation in this one-turn protocol.
             await agents.cancel(session_id)
 
-    import asyncio
     watcher = asyncio.create_task(_watch_for_cancel())
-
     final_status = "done"
     last_text = ""
+
+    async def _forward(event: dict[str, Any]) -> None:
+        nonlocal last_text
+        if event.get("type") == "message.delta":
+            last_text += event.get("data") or ""
+        await ws.send_json(event)
+
     try:
-        async for event in agents.run_turn(
-            job_id=job_id,
-            session_id=session_id,
-            grok_session_id=session["grok_session_id"],
-            cwd=Path(session["cwd"]),
-            text=first.get("text", ""),
-            model=first.get("model"),
-            reasoning_effort=first.get("reasoningEffort"),
-            attachments=first.get("attachments"),
-        ):
-            if event["type"] == "message.delta":
-                last_text += event.get("data", "")
-            if event["type"] == "cancelled":
-                final_status = "cancelled"
-            elif event["type"] == "message.error":
-                final_status = "error"
-            try:
-                await ws.send_json(event)
-            except Exception:
-                break
+        while True:
+            getter = asyncio.create_task(queue.get())
+            done, _ = await asyncio.wait({getter, turn},
+                                         return_when=asyncio.FIRST_COMPLETED)
+            if getter in done:
+                await _forward(getter.result())
+                continue
+            getter.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await getter
+            break
+
+        # Drain whatever landed between the turn finishing and this point.
+        while not queue.empty():
+            await _forward(queue.get_nowait())
+
+        result = await turn
+        stop_reason = result.get("stopReason")
+        if stop_reason == "cancelled":
+            final_status = "cancelled"
+        # The response to session/prompt is the single canonical end of a turn
+        # (ACP v1). grok also announces completion on two vendor channels; those
+        # arrive as turn.telemetry so a turn never ends more than once.
+        await ws.send_json({"type": "message.done", "stopReason": stop_reason,
+                            "usage": result.get("usage"), "job_id": job_id})
+        if stop_reason == "cancelled":
+            # Kept for the current app, which treats `cancelled` as terminal.
+            await ws.send_json({"type": "cancelled", "job_id": job_id})
+
+    except (AgentBusy, AgentCapacity) as e:
+        final_status = "error"
+        with contextlib.suppress(Exception):
+            await ws.send_json({"type": "message.error", "message": str(e),
+                                "code": "busy", "job_id": job_id})
+    except SandboxNotEnforced as e:
+        final_status = "error"
+        log.error("refusing to serve: %s", e)
+        with contextlib.suppress(Exception):
+            await ws.send_json({
+                "type": "message.error", "code": "sandbox_not_enforced",
+                "message": "The agent sandbox is not active on the Mac, so the "
+                           "Bridge refused to start an agent.",
+                "job_id": job_id})
+    except AgentUnavailable as e:
+        final_status = "error"
+        log.warning("session %s: agent unavailable: %s", session_id, e)
+        with contextlib.suppress(Exception):
+            await ws.send_json({
+                "type": "message.error", "code": "agent_unavailable",
+                "message": "The agent stopped unexpectedly. Try sending again.",
+                "job_id": job_id})
+    except Exception:
+        final_status = "error"
+        log.exception("session %s: turn failed", session_id)
+        with contextlib.suppress(Exception):
+            await ws.send_json({
+                "type": "message.error", "code": "internal",
+                "message": "The Bridge hit an internal error handling this turn.",
+                "job_id": job_id})
     finally:
         watcher.cancel()
+        if not turn.done():
+            turn.cancel()
+        agents.detach(session_id, queue)
         store.finish_job(job_id, final_status)
-        if final_status == "cancelled":
-            # grok's session lock can get stuck after a SIGTERM'd turn (see
-            # db.rotate_grok_session_id) -- rotate now so the *next* message
-            # in this Bridge session doesn't hit "Session ID already in use".
-            store.rotate_grok_session_id(session_id)
         if last_text:
             store.add_message_preview(session_id, "assistant", last_text)
-        try:
+        with contextlib.suppress(Exception):
             await ws.close()
-        except Exception:
-            pass
+
+
+def _prompt_blocks(text: str, attachments: list[str] | None) -> list[dict[str, Any]]:
+    """Build ACP prompt content.
+
+    Images go as real image blocks -- they work despite the agent advertising
+    promptCapabilities.image = false, which was measured, not assumed. Anything
+    else is referenced with grok's own `@path` syntax, as the previous
+    implementation did.
+    """
+    import base64
+    import mimetypes
+
+    blocks: list[dict[str, Any]] = []
+    extra_refs: list[str] = []
+    for raw in attachments or []:
+        path = Path(raw)
+        mime, _ = mimetypes.guess_type(path.name)
+        if mime and mime.startswith("image/") and path.is_file():
+            blocks.append({
+                "type": "image",
+                "mimeType": mime,
+                "data": base64.b64encode(path.read_bytes()).decode(),
+            })
+        else:
+            extra_refs.append(f"@{raw}")
+
+    body = text + ("".join(f" {ref}" for ref in extra_refs) if extra_refs else "")
+    blocks.insert(0, {"type": "text", "text": body})
+    return blocks
