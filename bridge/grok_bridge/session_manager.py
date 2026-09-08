@@ -35,13 +35,18 @@ class AgentCapacity(RuntimeError):
 
 
 class AcpSessionManager:
-    def __init__(self) -> None:
+    def __init__(self, journal=None) -> None:
         self._procs: dict[str, AcpProcess] = {}
         self._queues: dict[str, set[asyncio.Queue]] = {}
-        self._seq: dict[str, int] = {}
         self._starting: dict[str, asyncio.Lock] = {}
         self._reaper: asyncio.Task | None = None
         self._sandbox_verified = False
+        self._started_sessions: set[str] = set()
+        # Store-shaped: append_event / latest_seq / events_after. Injected so the
+        # manager can be exercised without a database.
+        self._journal = journal
+        self._fallback_seq: dict[str, int] = {}
+        self._current_job: dict[str, str] = {}
 
     # ------------------------------------------------------------- lifecycle
 
@@ -88,11 +93,41 @@ class AcpSessionManager:
             self._queues.pop(session_id, None)
 
     def _emit(self, session_id: str, event: dict[str, Any]) -> None:
-        seq = self._seq.get(session_id, 0) + 1
-        self._seq[session_id] = seq
+        """Number the event, persist it, then fan it out.
+
+        Persisting before delivery is what makes resume work: a client that was
+        not connected -- or dropped mid-turn -- asks for everything after the
+        last seq it saw, and the journal has it. Numbering comes from the
+        journal too, so sequence continues across a Bridge restart instead of
+        restarting at 1 and colliding with what the client already has.
+        """
+        job_id = self._current_job.get(session_id)
+        if self._journal is not None:
+            try:
+                seq = self._journal.append_event(session_id, event, job_id)
+            except Exception:
+                log.exception("failed to journal event for session %s", session_id)
+                seq = self._next_fallback_seq(session_id)
+        else:
+            seq = self._next_fallback_seq(session_id)
+
         event = {**event, "seq": seq}
+        if job_id and "job_id" not in event:
+            event["job_id"] = job_id
         for queue in list(self._queues.get(session_id, ())):
             queue.put_nowait(event)
+
+    def _next_fallback_seq(self, session_id: str) -> int:
+        seq = self._fallback_seq.get(session_id, 0) + 1
+        self._fallback_seq[session_id] = seq
+        return seq
+
+    def set_job(self, session_id: str, job_id: str | None) -> None:
+        """Tag subsequent events with the turn that produced them."""
+        if job_id is None:
+            self._current_job.pop(session_id, None)
+        else:
+            self._current_job[session_id] = job_id
 
     def emit(self, session_id: str, event: dict[str, Any]) -> None:
         """Publish a Bridge-originated event on the same ordered stream."""
@@ -125,10 +160,12 @@ class AcpSessionManager:
                 cwd=cwd,
                 model=model,
                 reasoning_effort=reasoning_effort,
-                # A session that has run before is resumed rather than recreated,
-                # so a reaped or crashed agent comes back with its context. The
-                # Phase 0 spike confirmed session/load restores it losslessly.
-                resume=session_id in self._seq,
+                # A session that has run before is resumed rather than
+                # recreated, so a reaped or crashed agent comes back with its
+                # context. The Phase 0 spike confirmed session/load restores it
+                # losslessly. "Has run before" survives a Bridge restart by
+                # asking the journal, not an in-memory set.
+                resume=self._has_history(session_id),
             )
 
     async def _spawn(
@@ -171,8 +208,18 @@ class AcpSessionManager:
                 raise
 
         self._procs[session_id] = proc
-        self._seq.setdefault(session_id, 0)
+        self._started_sessions.add(session_id)
         return proc
+
+    def _has_history(self, session_id: str) -> bool:
+        if session_id in self._started_sessions:
+            return True
+        if self._journal is not None:
+            try:
+                return self._journal.latest_seq(session_id) > 0
+            except Exception:
+                log.exception("journal lookup failed for session %s", session_id)
+        return False
 
     def _make_room(self) -> None:
         """Evict an idle agent if we are at capacity; never a running one."""

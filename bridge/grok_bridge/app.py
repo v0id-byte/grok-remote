@@ -44,7 +44,7 @@ from .security import InvalidCwd, validate_cwd
 from .session_manager import AcpSessionManager, AgentCapacity
 
 store = Store()
-agents = AcpSessionManager()
+agents = AcpSessionManager(journal=store)
 START_TIME = time.time()
 
 
@@ -428,3 +428,193 @@ def _prompt_blocks(text: str, attachments: list[str] | None) -> list[dict[str, A
     body = text + ("".join(f" {ref}" for ref in extra_refs) if extra_refs else "")
     blocks.insert(0, {"type": "text", "text": body})
     return blocks
+
+
+# ---------------------------------------------------------------- /v2/chat
+
+
+class _V2Error(Exception):
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def _ws_bearer(ws: WebSocket) -> str | None:
+    """Authenticate from the upgrade request's own headers.
+
+    v1 accepted the socket first and read the token from the first frame, which
+    means an unauthenticated peer got a live connection before proving anything.
+    Here a bad token never gets past the handshake.
+    """
+    header = ws.headers.get("authorization") or ""
+    if not header.startswith("Bearer "):
+        return None
+    token = header.removeprefix("Bearer ").strip()
+    device_id, _, secret = token.partition(".")
+    if not device_id or not secret or not store.check_device_token(device_id, secret):
+        return None
+    return device_id
+
+
+@app.websocket("/v2/chat")
+async def chat_v2(ws: WebSocket) -> None:
+    """Session-scoped, resumable connection (plan v2 §2.2).
+
+    Differences from /v1/chat, which stays until the app has migrated:
+
+      * one socket per session, not per turn, so several turns and any
+        out-of-band events share one ordered stream;
+      * authentication happens at the upgrade, not in the first frame;
+      * the client says how far it got (`afterSeq`) and the Bridge replays what
+        it missed from the journal, so a phone that drops mid-turn -- which iOS
+        does routinely when backgrounded -- loses nothing.
+    """
+    ip = _client_ip(ws)
+    if _throttle(_auth_failures, ip, config.AUTH_FAIL_WINDOW_SECONDS, config.AUTH_FAIL_MAX):
+        await ws.close(code=4429)
+        return
+    if _ws_bearer(ws) is None:
+        _note_auth_failure(ip, "invalid device token (ws v2)")
+        await ws.close(code=4401)
+        return
+
+    await ws.accept()
+    try:
+        hello = await asyncio.wait_for(ws.receive_json(), 30)
+    except Exception:
+        await ws.close(code=4400)
+        return
+
+    if hello.get("type") != "hello":
+        await ws.close(code=4400)
+        return
+
+    session_id = hello.get("sessionId")
+    session = store.get_session(session_id) if session_id else None
+    if session is None:
+        await ws.close(code=4404)
+        return
+
+    queue = agents.attach(session_id)
+    send_lock = asyncio.Lock()
+    writer: asyncio.Task | None = None
+
+    async def send(payload: dict[str, Any]) -> None:
+        async with send_lock:
+            await ws.send_json(payload)
+
+    try:
+        # Subscribe first, then replay: an event produced between the replay
+        # query and the subscription would otherwise fall through the gap.
+        after_seq = int(hello.get("afterSeq") or 0)
+        missed = store.events_after(session_id, after_seq)
+        await send({
+            "type": "hello.ack",
+            "sessionId": session_id,
+            "currentSeq": store.latest_seq(session_id),
+            "sessionState": agents.state_of(session_id),
+            "replayed": len(missed),
+            "cwd": session["cwd"],
+        })
+        for event in missed:
+            await send(event)
+
+        writer = asyncio.create_task(_v2_writer(send, queue, after_seq))
+        turn: asyncio.Task | None = None
+
+        while True:
+            frame = await ws.receive_json()
+            kind = frame.get("type")
+
+            if kind == "prompt":
+                if turn is not None and not turn.done():
+                    await send({"type": "error", "code": "session_busy",
+                                "message": "A turn is already running in this session."})
+                    continue
+                turn = asyncio.create_task(_v2_turn(session_id, session, frame))
+            elif kind == "cancel":
+                await agents.cancel(session_id)
+            elif kind == "ping":
+                await send({"type": "pong"})
+            else:
+                await send({"type": "error", "code": "unknown_frame",
+                            "message": f"unsupported frame type: {kind!r}"})
+
+    except (WebSocketDisconnect, RuntimeError, ValueError):
+        # A dropped socket is NOT a cancellation here: the turn keeps running and
+        # the client picks it up again with afterSeq. That is the whole point.
+        pass
+    except Exception:
+        log.exception("session %s: v2 socket failed", session_id)
+    finally:
+        if writer is not None:
+            writer.cancel()
+        agents.detach(session_id, queue)
+        with contextlib.suppress(Exception):
+            await ws.close()
+
+
+async def _v2_writer(send, queue: asyncio.Queue, after_seq: int) -> None:
+    """Forward live events, skipping anything the replay already delivered."""
+    while True:
+        event = await queue.get()
+        if event.get("seq") is not None and event["seq"] <= after_seq:
+            continue
+        await send(event)
+
+
+async def _v2_turn(session_id: str, session, frame: dict[str, Any]) -> None:
+    """Run one turn, reporting entirely through the journalled event stream.
+
+    Nothing is written straight to the socket: every event goes through the
+    manager so it is numbered and persisted, which is what lets a client that
+    disconnects mid-turn replay it.
+    """
+    job_id = store.create_job(session_id)
+    agents.set_job(session_id, job_id)
+    store.add_message_preview(session_id, "user", frame.get("text", ""))
+    store.touch_session(session_id)
+
+    status = "done"
+    try:
+        result = await agents.prompt(
+            session_id=session_id,
+            grok_session_id=session["grok_session_id"],
+            cwd=Path(session["cwd"]),
+            blocks=_prompt_blocks(frame.get("text", ""), frame.get("attachments")),
+            model=frame.get("model"),
+            reasoning_effort=frame.get("reasoningEffort"),
+        )
+        stop_reason = result.get("stopReason")
+        if stop_reason == "cancelled":
+            status = "cancelled"
+        agents.emit(session_id, {"type": "message.done", "stopReason": stop_reason,
+                                 "usage": result.get("usage")})
+    except (AgentBusy, AgentCapacity) as e:
+        status = "error"
+        agents.emit(session_id, {"type": "message.error", "code": "busy",
+                                 "message": str(e)})
+    except SandboxNotEnforced as e:
+        status = "error"
+        log.error("refusing to serve session %s: %s", session_id, e)
+        agents.emit(session_id, {
+            "type": "message.error", "code": "sandbox_not_enforced",
+            "message": "The agent sandbox is not active on the Mac, so the Bridge "
+                       "refused to start an agent."})
+    except AgentUnavailable as e:
+        status = "error"
+        log.warning("session %s: agent unavailable: %s", session_id, e)
+        agents.emit(session_id, {
+            "type": "message.error", "code": "agent_unavailable",
+            "message": "The agent stopped unexpectedly. Try sending again."})
+    except Exception:
+        status = "error"
+        log.exception("session %s: v2 turn failed", session_id)
+        agents.emit(session_id, {
+            "type": "message.error", "code": "internal",
+            "message": "The Bridge hit an internal error handling this turn."})
+    finally:
+        agents.set_job(session_id, None)
+        store.finish_job(job_id, status)
+        store.prune_session_events(session_id)

@@ -59,6 +59,65 @@ async def turn(base_ws, token, session_id, text, model=None, cancel_after=None):
         return await collect(ws)
 
 
+async def v2_resume(base_ws, token, session_id, model) -> None:
+    """The claim /v2/chat exists to make good on.
+
+    Start a turn, hang up mid-stream, reconnect saying how far we got, and get
+    the rest. Under v1 a dropped socket cancelled the turn and the output was
+    gone; iOS suspends backgrounded apps, so this is the normal case.
+    """
+    headers = {"Authorization": f"Bearer {token}"}
+    seen_seq = 0
+    saw_before = 0
+
+    async with websockets.connect(f"{base_ws}/v2/chat", additional_headers=headers,
+                                  max_size=32 * 1024 * 1024) as ws:
+        await ws.send(json.dumps({"type": "hello", "protocolVersion": 2,
+                                  "sessionId": session_id, "afterSeq": 0}))
+        ack = json.loads(await ws.recv())
+        check(ack["type"] == "hello.ack", "v2 hello.ack received",
+              f"currentSeq={ack.get('currentSeq')}")
+        seen_seq = ack["currentSeq"]
+
+        await ws.send(json.dumps({"type": "prompt", "model": model,
+                                  "text": "Write a detailed 4000-word history of the "
+                                          "bicycle. Do not use tools."}))
+        # Read a little, then hang up hard, mid-turn.
+        deadline = asyncio.get_event_loop().time() + 12
+        while asyncio.get_event_loop().time() < deadline:
+            event = json.loads(await asyncio.wait_for(ws.recv(), 60))
+            seen_seq = max(seen_seq, event.get("seq") or 0)
+            if event["type"] == "message.delta":
+                saw_before += 1
+                if saw_before >= 5:
+                    break
+    check(saw_before > 0, "v2 streamed events before the disconnect",
+          f"{saw_before} deltas, seq={seen_seq}")
+
+    # Socket is gone; the turn must keep running on the Mac.
+    await asyncio.sleep(3)
+
+    async with websockets.connect(f"{base_ws}/v2/chat", additional_headers=headers,
+                                  max_size=32 * 1024 * 1024) as ws:
+        await ws.send(json.dumps({"type": "hello", "protocolVersion": 2,
+                                  "sessionId": session_id, "afterSeq": seen_seq}))
+        ack = json.loads(await ws.recv())
+        check(ack["replayed"] > 0, "reconnect replayed what was missed",
+              f"replayed={ack['replayed']}")
+        got_done = False
+        seqs = []
+        while True:
+            event = json.loads(await asyncio.wait_for(ws.recv(), 300))
+            seqs.append(event.get("seq"))
+            if event["type"] in ("message.done", "message.error"):
+                got_done = event["type"] == "message.done"
+                break
+        check(got_done, "the turn finished despite the disconnect")
+        check(all(b > a for a, b in zip(seqs, seqs[1:])), "replayed seq is strictly ordered")
+        check(min(seqs) > seen_seq, "no event was delivered twice",
+              f"first replayed seq={min(seqs)} > {seen_seq}")
+
+
 async def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="http://127.0.0.1:8899")
@@ -142,6 +201,9 @@ async def main() -> int:
             check(bool(ours) and ours[-1].get("enforced") is True,
                   "grok-remote profile applied and enforcing",
                   json.dumps(ours[-1])[:140] if ours else "no events")
+            print("\n== v2: drop the socket mid-turn and resume ==")
+            await v2_resume(base_ws, token, session_id, args.model)
+
             print("\n== a cwd outside the allowed roots is refused ==")
             r = await http.post("/v1/sessions", json={"cwd": "/etc"}, headers=auth)
             check(r.status_code == 403, "cwd outside allowed roots rejected",

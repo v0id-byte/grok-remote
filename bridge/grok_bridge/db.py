@@ -9,6 +9,7 @@ a Bridge restart without leaving a job stuck showing "generating...".
 from __future__ import annotations
 
 import hmac
+import json
 import sqlite3
 import time
 import uuid
@@ -43,6 +44,16 @@ CREATE TABLE IF NOT EXISTS jobs (
     ended_at REAL
 );
 
+CREATE TABLE IF NOT EXISTS session_events (
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    seq        INTEGER NOT NULL,
+    job_id     TEXT,
+    type       TEXT NOT NULL,
+    payload    TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (session_id, seq)
+);
+
 CREATE TABLE IF NOT EXISTS devices (
     device_id TEXT PRIMARY KEY,
     secret TEXT NOT NULL,
@@ -59,6 +70,11 @@ CREATE TABLE IF NOT EXISTS pairing_tokens (
 """
 
 PREVIEW_LEN = 200
+
+# One event's stored payload is capped; tool output can run to megabytes and the
+# journal is a replay buffer, not an archive.
+MAX_EVENT_PAYLOAD = 64 * 1024
+EVENT_KEEP_PER_SESSION = 2000
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, col: str, decl: str) -> None:
@@ -195,6 +211,73 @@ class Store:
                 "UPDATE jobs SET status = ?, ended_at = ? WHERE id = ?",
                 (status, time.time(), job_id),
             )
+
+    # -- event journal ---------------------------------------------------
+    #
+    # A high-water mark alone cannot replay anything: a phone that drops
+    # mid-turn needs the events it missed, not the number of them. seq is
+    # session-level and monotonic, so prompts, commands and config changes share
+    # one order and a client can say "everything after N" regardless of which
+    # turn produced it.
+
+    def append_event(self, session_id: str, event: dict, job_id: str | None = None) -> int:
+        """Persist one event and return its sequence number.
+
+        The sequence is allocated inside the INSERT so two concurrent writers
+        cannot pick the same number.
+        """
+        payload = json.dumps(event, ensure_ascii=False)
+        if len(payload) > MAX_EVENT_PAYLOAD:
+            # Tool output can be enormous. Keep the envelope replayable and mark
+            # the body as clipped rather than letting one event bloat the log.
+            clipped = {k: v for k, v in event.items() if k in ("type", "toolCallId", "status")}
+            clipped["truncated"] = True
+            clipped["bytes"] = len(payload)
+            payload = json.dumps(clipped, ensure_ascii=False)
+        with self._conn() as conn:
+            cur = conn.execute(
+                "INSERT INTO session_events (session_id, seq, job_id, type, payload, created_at) "
+                "VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM session_events "
+                "WHERE session_id = ?), ?, ?, ?, ?) RETURNING seq",
+                (session_id, session_id, job_id, event.get("type", "?"), payload, time.time()),
+            )
+            return int(cur.fetchone()[0])
+
+    def latest_seq(self, session_id: str) -> int:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM session_events WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return int(row[0])
+
+    def events_after(self, session_id: str, after_seq: int, limit: int = 1000) -> list[dict]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT seq, payload FROM session_events WHERE session_id = ? AND seq > ? "
+                "ORDER BY seq LIMIT ?",
+                (session_id, after_seq, limit),
+            ).fetchall()
+        out = []
+        for row in rows:
+            try:
+                event = json.loads(row["payload"])
+            except json.JSONDecodeError:
+                continue
+            event["seq"] = row["seq"]
+            out.append(event)
+        return out
+
+    def prune_session_events(self, session_id: str, keep: int = EVENT_KEEP_PER_SESSION) -> int:
+        """Bounded retention. The journal exists to survive a dropped
+        connection, not to be a permanent transcript -- grok keeps that."""
+        with self._conn() as conn:
+            cur = conn.execute(
+                "DELETE FROM session_events WHERE session_id = ? AND seq <= "
+                "(SELECT COALESCE(MAX(seq), 0) - ? FROM session_events WHERE session_id = ?)",
+                (session_id, keep, session_id),
+            )
+        return cur.rowcount
 
     # -- devices -------------------------------------------------------------
 
