@@ -107,6 +107,9 @@ class Store:
         with _connect(self.db_path) as conn:
             conn.executescript(SCHEMA)
             _ensure_column(conn, "pairing_tokens", "expires_at", "REAL")
+            _ensure_column(conn, "sessions", "model", "TEXT")
+            _ensure_column(conn, "sessions", "reasoning_effort", "TEXT")
+            _ensure_column(conn, "sessions", "permission_mode", "TEXT")
             # Backfill rows written before the TTL existed. Without this they
             # keep expires_at = NULL and stay redeemable forever, which is the
             # exact hole the TTL was added to close -- this database really did
@@ -145,6 +148,36 @@ class Store:
                 (session_id, session_id, cwd, title, now, now),
             )
         return session_id
+
+    def update_session(self, session_id: str, **fields) -> bool:
+        """Patch a session's mutable columns. Unknown keys are ignored rather
+        than trusted into an SQL string."""
+        allowed = {"title", "model", "reasoning_effort", "permission_mode",
+                   "grok_session_id", "cwd"}
+        sets = {k: v for k, v in fields.items() if k in allowed}
+        if not sets:
+            return False
+        assignments = ", ".join(f"{k} = ?" for k in sets)
+        with self._conn() as conn:
+            cur = conn.execute(
+                f"UPDATE sessions SET {assignments} WHERE id = ?",
+                (*sets.values(), session_id),
+            )
+        return cur.rowcount > 0
+
+    def delete_session(self, session_id: str) -> bool:
+        """Remove the Bridge's record of a session.
+
+        grok's own session directory is deliberately left alone: it holds the
+        real transcript, and the Bridge is a client of that history, not its
+        owner.
+        """
+        with self._conn() as conn:
+            conn.execute("DELETE FROM session_events WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM jobs WHERE session_id = ?", (session_id,))
+            cur = conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+        return cur.rowcount > 0
 
     def touch_session(self, session_id: str) -> None:
         with self._conn() as conn:

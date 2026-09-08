@@ -207,6 +207,19 @@ class AcpSessionManager:
                 await proc.close()
                 raise
 
+        if proc.grok_session_id != grok_session_id and self._journal is not None:
+            # session/new mints grok's OWN session id, which is not the one the
+            # Bridge generated. Without writing it back, history lookups search
+            # a directory that does not exist and a respawn tries to
+            # session/load an id grok never issued.
+            try:
+                self._journal.update_session(
+                    session_id, grok_session_id=proc.grok_session_id)
+                log.info("session %s: bound to grok session %s",
+                         session_id, proc.grok_session_id)
+            except Exception:
+                log.exception("failed to persist grok session id for %s", session_id)
+
         self._procs[session_id] = proc
         self._started_sessions.add(session_id)
         return proc
@@ -244,6 +257,20 @@ class AcpSessionManager:
         proc = self._procs.pop(session_id, None)
         if proc:
             await proc.close()
+
+    async def retire(self, session_id: str) -> None:
+        """Stop this session's agent, if one is running."""
+        await self._retire(session_id)
+
+    def forget(self, session_id: str) -> None:
+        """Drop the belief that this session has history.
+
+        Used by /clear, which starts a fresh grok-side conversation under the
+        same Bridge session id: without this the next spawn would try to
+        session/load an id that has no transcript.
+        """
+        self._started_sessions.discard(session_id)
+        self._fallback_seq.pop(session_id, None)
 
     async def _reap_loop(self) -> None:
         while True:

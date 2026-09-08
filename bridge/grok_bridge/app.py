@@ -36,7 +36,8 @@ from fastapi import (
 )
 from fastapi.responses import JSONResponse
 
-from . import config
+from . import commands as cmd_registry
+from . import config, grok_disk, workspace
 from .acp import AgentBusy, AgentUnavailable
 from .db import Store
 from .sandbox import SandboxNotEnforced
@@ -174,32 +175,20 @@ def revoke_device(
 
 @app.get("/v1/models")
 def list_models(request: Request, authorization: str | None = Header(None)) -> dict[str, Any]:
+    """Model catalogue, read from grok's own files.
+
+    This used to shell out to `grok models` and screen-scrape stdout with a
+    regex. Reading models_cache.json and config.toml instead gives names,
+    context windows and per-model reasoning efforts, none of which the CLI's
+    text output carries -- and the local qwen/muse models exist only in
+    config.toml, so both sources are required.
+    """
     _check_bearer(authorization, request)
-    proc = subprocess.run([config.GROK_BIN, "models"], capture_output=True, text=True, timeout=15)
-    models = []
-    default_model = None
-    for line in proc.stdout.splitlines():
-        m = re.match(r"^\s*([*-])\s+(\S+)", line)
-        if not m:
-            continue
-        marker, name = m.groups()
-        is_default = marker == "*"
-        if is_default:
-            default_model = name
-        models.append({
-            "id": name,
-            "default": is_default,
-            "vision": _model_vision_capability(name),
-        })
-    return {"models": models, "default": default_model}
-
-
-def _model_vision_capability(model_id: str) -> bool:
-    # Unknown-model-default-false capability cache (plan v1.3 §1 "vision 能力判断").
-    # xAI first-party models assumed vision-capable; local qwen/muse models
-    # assumed not, until manually verified and flipped here.
-    known_vision_models = {"grok-4.6", "grok-4.5"}
-    return model_id in known_vision_models
+    catalogue = grok_disk.read_models()
+    models = list(catalogue["models"].values())
+    for model in models:
+        model["vision"] = model["id"] in _VISION_MODELS
+    return {"models": models, "default": catalogue["default"]}
 
 
 @app.get("/v1/recent-dirs")
@@ -210,18 +199,39 @@ def recent_dirs(request: Request, authorization: str | None = Header(None)) -> d
 
 @app.get("/v1/sessions")
 def list_sessions(request: Request, authorization: str | None = Header(None)) -> dict[str, Any]:
+    """Sessions, enriched with grok's own metadata.
+
+    The Bridge stores little more than a cwd; grok's summary.json has the
+    generated title, the model actually in use, the git branch and a summary of
+    the last turn. Folded in lazily and tolerant of it being absent -- a session
+    that has not run a turn yet has no summary file.
+    """
     _check_bearer(authorization, request)
-    sessions = []
+    out = []
     for row in store.list_sessions():
-        sessions.append({
+        session = {
             "id": row["id"],
             "cwd": row["cwd"],
             "title": row["title"],
             "created_at": row["created_at"],
             "last_active_at": row["last_active_at"],
             "last_message_preview": store.last_message_preview(row["id"]),
-        })
-    return {"sessions": sessions}
+            "model": row["model"] if "model" in row.keys() else None,
+            "reasoningEffort": row["reasoning_effort"] if "reasoning_effort" in row.keys() else None,
+            "state": agents.state_of(row["id"]),
+            # Sessions outlive their directories -- a deleted checkout should be
+            # visibly broken in the list rather than failing on first use.
+            "cwdExists": Path(row["cwd"]).is_dir(),
+        }
+        summary = grok_disk.read_summary(row["cwd"], row["grok_session_id"])
+        if summary:
+            session["title"] = session["title"] or summary.get("title")
+            session["model"] = session["model"] or summary.get("model")
+            session["messageCount"] = summary.get("messageCount")
+            session["headBranch"] = summary.get("headBranch")
+            session["lastTurnSummary"] = summary.get("lastTurnSummary")
+        out.append(session)
+    return {"sessions": out}
 
 
 @app.post("/v1/sessions")
@@ -400,6 +410,9 @@ async def chat(ws: WebSocket) -> None:
             await ws.close()
 
 
+_VISION_MODELS = {"grok-4.6", "grok-4.5"}
+
+
 def _prompt_blocks(text: str, attachments: list[str] | None) -> list[dict[str, Any]]:
     """Build ACP prompt content.
 
@@ -533,6 +546,24 @@ async def chat_v2(ws: WebSocket) -> None:
                                 "message": "A turn is already running in this session."})
                     continue
                 turn = asyncio.create_task(_v2_turn(session_id, session, frame))
+            elif kind == "command":
+                # ACP-native commands stream their output, so they go in as a
+                # prompt; bridge and shell commands are request/response and
+                # publish a single result event. Either way the outcome lands on
+                # the journalled stream, in order with the rest of the session.
+                name = (frame.get("name") or "").lstrip("/").strip()
+                args = frame.get("args")
+                canonical, ckind = cmd_registry.resolve(name)
+                if ckind == "acp":
+                    text = f"/{canonical}" + (f" {args}" if args else "")
+                    if turn is not None and not turn.done():
+                        await send({"type": "error", "code": "session_busy",
+                                    "message": "A turn is already running in this session."})
+                    else:
+                        turn = asyncio.create_task(
+                            _v2_turn(session_id, session, {**frame, "text": text}))
+                else:
+                    asyncio.create_task(_v2_command(session_id, session, name, args))
             elif kind == "cancel":
                 await agents.cancel(session_id)
             elif kind == "ping":
@@ -618,3 +649,237 @@ async def _v2_turn(session_id: str, session, frame: dict[str, Any]) -> None:
         agents.set_job(session_id, None)
         store.finish_job(job_id, status)
         store.prune_session_events(session_id)
+
+
+# ------------------------------------------------------- workspace / picker
+
+
+@app.get("/v1/repos")
+def list_repos(request: Request, refresh: bool = False,
+               authorization: str | None = Header(None)) -> dict[str, Any]:
+    """Git repositories under the allowed roots.
+
+    Deliberately returns path and name only. Branch and dirty count each cost a
+    subprocess, and `git status` genuinely hangs in at least one worktree on
+    this machine -- so status is a separate, bounded call for the rows a client
+    is actually showing.
+    """
+    _check_bearer(authorization, request)
+    return {"repos": workspace.find_repos(refresh=refresh)}
+
+
+@app.post("/v1/repos/status")
+def repos_status(body: dict[str, Any], request: Request,
+                 authorization: str | None = Header(None)) -> dict[str, Any]:
+    _check_bearer(authorization, request)
+    paths = body.get("paths") or []
+    if not isinstance(paths, list) or len(paths) > 100:
+        raise HTTPException(400, "paths must be a list of at most 100 entries")
+    return {"status": workspace.repo_status([str(p) for p in paths])}
+
+
+@app.get("/v1/fs/list")
+def fs_list(request: Request, path: str = str(config.HOME),
+            authorization: str | None = Header(None)) -> dict[str, Any]:
+    _check_bearer(authorization, request)
+    try:
+        return workspace.list_dir(path)
+    except PermissionError as e:
+        raise HTTPException(403, str(e)) from e
+    except (FileNotFoundError, NotADirectoryError) as e:
+        raise HTTPException(404, str(e)) from e
+
+
+# ------------------------------------------------------------- sessions
+
+
+@app.get("/v1/sessions/{session_id}/messages")
+def session_messages(session_id: str, request: Request, limit: int = 50,
+                     before: int | None = None,
+                     authorization: str | None = Header(None)) -> dict[str, Any]:
+    """Replay the conversation from grok's own transcript.
+
+    The Bridge stores only 200-character previews, so before this endpoint
+    existed, leaving a session and coming back showed an empty screen. Paginated
+    because a long session is thousands of turns.
+    """
+    _check_bearer(authorization, request)
+    session = store.get_session(session_id)
+    if session is None:
+        raise HTTPException(404, "unknown session")
+    return grok_disk.read_history(session["cwd"], session["grok_session_id"],
+                                  limit=min(max(limit, 1), 200), before=before)
+
+
+@app.patch("/v1/sessions/{session_id}")
+async def patch_session(session_id: str, body: dict[str, Any], request: Request,
+                        authorization: str | None = Header(None)) -> dict[str, Any]:
+    _check_bearer(authorization, request)
+    session = store.get_session(session_id)
+    if session is None:
+        raise HTTPException(404, "unknown session")
+
+    fields: dict[str, Any] = {}
+    if "title" in body:
+        fields["title"] = body["title"]
+    if "model" in body:
+        fields["model"] = body["model"]
+    if "reasoningEffort" in body:
+        fields["reasoning_effort"] = body["reasoningEffort"]
+    if fields:
+        store.update_session(session_id, **fields)
+
+    # Apply to the live agent too, when there is one.
+    if body.get("model"):
+        proc = agents._procs.get(session_id)
+        if proc is not None and proc.alive:
+            try:
+                await proc.set_model(body["model"])
+            except AgentBusy as e:
+                raise HTTPException(409, str(e)) from e
+    return {"ok": True, **{k: v for k, v in fields.items()}}
+
+
+@app.delete("/v1/sessions/{session_id}")
+async def delete_session(session_id: str, request: Request,
+                         authorization: str | None = Header(None)) -> dict[str, bool]:
+    _check_bearer(authorization, request)
+    await agents.retire(session_id)
+    return {"deleted": store.delete_session(session_id)}
+
+
+# ------------------------------------------------------------- commands
+
+
+@app.get("/v1/sessions/{session_id}/commands")
+async def session_commands(session_id: str, request: Request,
+                           authorization: str | None = Header(None)) -> dict[str, Any]:
+    """The merged command palette for one session.
+
+    ACP-native commands are discovered live from the agent; the rest are
+    implemented here because grok does not expose them over ACP at all. Each
+    entry says which it is, so the UI can be honest about what it is offering.
+    """
+    _check_bearer(authorization, request)
+    session = store.get_session(session_id)
+    if session is None:
+        raise HTTPException(404, "unknown session")
+
+    proc = agents._procs.get(session_id)
+    acp_commands = proc.available_commands if proc and proc.alive else []
+    session_models = proc.models if proc and proc.alive else {}
+    current_model = (session["model"] if "model" in session.keys() else None) \
+        or (session_models.get("currentModelId") if session_models else None)
+
+    return {
+        # ACP-native commands are discovered from a running agent, so an idle
+        # session lists only the bridge-native ones. Say so, rather than letting
+        # the palette look mysteriously short.
+        "acpAvailable": bool(proc and proc.alive),
+        "commands": cmd_registry.describe(
+            acp_commands=acp_commands, session_models=session_models,
+            current_model=current_model),
+    }
+
+
+@app.post("/v1/sessions/{session_id}/command")
+async def run_command(session_id: str, body: dict[str, Any], request: Request,
+                      authorization: str | None = Header(None)) -> dict[str, Any]:
+    """Run a bridge-native or shell command.
+
+    ACP-native commands are not handled here: they produce streaming output and
+    belong on the session's event stream, so the client sends them as a prompt.
+    """
+    _check_bearer(authorization, request)
+    session = store.get_session(session_id)
+    if session is None:
+        raise HTTPException(404, "unknown session")
+    try:
+        return await _execute_command(session_id, session, body.get("name", ""),
+                                      body.get("args"))
+    except cmd_registry.CommandError as e:
+        raise HTTPException(400, str(e)) from e
+
+
+async def _execute_command(session_id: str, session, name: str,
+                           args: str | None) -> dict[str, Any]:
+    name = (name or "").lstrip("/").strip()
+    canonical, kind = cmd_registry.resolve(name)
+
+    if kind == "shell":
+        return {"command": canonical, "kind": "shell",
+                **await cmd_registry.run_shell(canonical, session["cwd"])}
+
+    if kind != "bridge":
+        raise cmd_registry.CommandError(
+            f"/{name} is an agent command -- send it as a prompt, not a command call")
+
+    if canonical == "cwd":
+        return {"command": "cwd", "kind": "bridge", "text": session["cwd"]}
+
+    if canonical == "help":
+        proc = agents._procs.get(session_id)
+        return {"command": "help", "kind": "bridge",
+                "data": cmd_registry.describe(
+                    acp_commands=proc.available_commands if proc and proc.alive else [])}
+
+    if canonical == "rename":
+        if not args:
+            raise cmd_registry.CommandError("/rename needs a title")
+        store.update_session(session_id, title=args)
+        agents.emit(session_id, {"type": "session.titled", "title": args})
+        return {"command": "rename", "kind": "bridge", "text": args}
+
+    if canonical == "model":
+        if not args:
+            raise cmd_registry.CommandError("/model needs a model id")
+        proc = await agents.get(session_id=session_id,
+                                grok_session_id=session["grok_session_id"],
+                                cwd=Path(session["cwd"]))
+        try:
+            await proc.set_model(args)
+        except AgentBusy as e:
+            raise cmd_registry.CommandError(str(e)) from e
+        store.update_session(session_id, model=args)
+        return {"command": "model", "kind": "bridge", "text": args}
+
+    if canonical == "effort":
+        if not args:
+            raise cmd_registry.CommandError("/effort needs a level")
+        # No ACP channel exists for reasoning effort -- it is a spawn-time flag.
+        # Restarting reloads the session, and context survives that.
+        store.update_session(session_id, reasoning_effort=args)
+        await agents.restart(session_id=session_id,
+                             grok_session_id=session["grok_session_id"],
+                             cwd=Path(session["cwd"]),
+                             model=session["model"] if "model" in session.keys() else None,
+                             reasoning_effort=args)
+        return {"command": "effort", "kind": "bridge", "text": args,
+                "note": "agent restarted; conversation context preserved"}
+
+    if canonical == "clear":
+        # A new grok-side conversation in the same directory, keeping the
+        # Bridge-facing session id so the client's URLs stay valid.
+        import uuid as _uuid
+        await agents.retire(session_id)
+        new_grok_id = str(_uuid.uuid4())
+        store.update_session(session_id, grok_session_id=new_grok_id)
+        agents.forget(session_id)
+        agents.emit(session_id, {"type": "session.cleared"})
+        return {"command": "clear", "kind": "bridge", "text": "started a new conversation"}
+
+    raise cmd_registry.CommandError(f"unknown command: /{name}")
+
+
+async def _v2_command(session_id: str, session, name: str, args: str | None) -> None:
+    """Run a non-streaming command and publish its result on the event stream."""
+    try:
+        result = await _execute_command(session_id, session, name, args)
+        agents.emit(session_id, {"type": "command.result", **result})
+    except cmd_registry.CommandError as e:
+        agents.emit(session_id, {"type": "command.error", "command": name,
+                                 "message": str(e)})
+    except Exception:
+        log.exception("session %s: command /%s failed", session_id, name)
+        agents.emit(session_id, {"type": "command.error", "command": name,
+                                 "message": "The command failed on the Bridge."})

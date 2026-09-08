@@ -201,6 +201,42 @@ async def main() -> int:
             check(bool(ours) and ours[-1].get("enforced") is True,
                   "grok-remote profile applied and enforcing",
                   json.dumps(ours[-1])[:140] if ours else "no events")
+            print("\n== history is readable back (needs grok's real session id) ==")
+            r = await http.get(f"/v1/sessions/{session_id}/messages",
+                               params={"limit": 10}, headers=auth)
+            page = r.json()
+            check(page["total"] > 0, "transcript replays from grok's own history",
+                  f"total={page['total']}")
+            texts = " ".join(m.get("text") or "" for m in page["messages"])
+            check("PINEAPPLE_7731" in texts or page["total"] >= 2,
+                  "replayed messages carry real content")
+            check(all(m["role"] in ("user", "assistant") for m in page["messages"]),
+                  "only real turns replayed (no system/reasoning/tool_result)")
+
+            print("\n== session list is enriched from grok's summary ==")
+            sessions = (await http.get("/v1/sessions", headers=auth)).json()["sessions"]
+            mine = next((x for x in sessions if x["id"] == session_id), None)
+            check(mine is not None and mine.get("messageCount"),
+                  "session carries grok's own metadata",
+                  json.dumps({k: mine.get(k) for k in
+                              ("title", "model", "messageCount", "headBranch")},
+                             ensure_ascii=False) if mine else "not found")
+
+            print("\n== command palette ==")
+            cmds = (await http.get(f"/v1/sessions/{session_id}/commands",
+                                   headers=auth)).json()
+            names = {c["name"] for c in cmds["commands"]}
+            check("model" in names and "status" in names, "bridge-native commands listed",
+                  f"{len(cmds['commands'])} total, acpAvailable={cmds['acpAvailable']}")
+            check(cmds["acpAvailable"] and any(c["source"] == "acp"
+                                               for c in cmds["commands"]),
+                  "ACP-native commands discovered from the live agent",
+                  f"{sum(1 for c in cmds['commands'] if c['source'] == 'acp')} from ACP")
+            rc = await http.post(f"/v1/sessions/{session_id}/command",
+                                 json={"name": "status"}, headers=auth)
+            check(rc.status_code == 200 and "data" in rc.json(),
+                  "/status runs via grok inspect --json")
+
             print("\n== v2: drop the socket mid-turn and resume ==")
             await v2_resume(base_ws, token, session_id, args.model)
 

@@ -190,3 +190,39 @@ async def test_second_prompt_is_refused_while_a_turn_runs(acp):
     # Still usable: no session-id rotation, unlike the SIGTERM path this replaced.
     assert proc.state is acp.SessionState.IDLE
     await proc.close()
+
+
+@pytest.mark.asyncio
+async def test_the_grok_session_id_is_written_back(acp, monkeypatch):
+    """session/new mints grok's own id, not the one the Bridge generated.
+
+    Losing it is silent and expensive: history lookups search a directory that
+    does not exist, and a respawned agent tries to session/load an id grok never
+    issued. This is the regression that made a smoke-tested session show an
+    empty transcript.
+    """
+    from grok_bridge.session_manager import AcpSessionManager
+
+    persisted: dict = {}
+
+    class FakeJournal:
+        def append_event(self, sid, event, job_id=None):
+            return 1
+
+        def latest_seq(self, sid):
+            return 0
+
+        def update_session(self, sid, **fields):
+            persisted.update(fields)
+            return True
+
+    monkeypatch.setenv("FAKE_ACP_SCENARIO", "basic")
+    manager = AcpSessionManager(journal=FakeJournal())
+    cwd = tempfile.mkdtemp()
+    proc = await manager.get(session_id="s1", grok_session_id="bridge-uuid",
+                             cwd=Path(cwd))
+    try:
+        assert proc.grok_session_id == "fake-session-0001"
+        assert persisted.get("grok_session_id") == "fake-session-0001"
+    finally:
+        await manager.shutdown()
