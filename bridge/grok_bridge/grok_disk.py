@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -67,6 +68,34 @@ def session_dir(cwd: str | Path, grok_session_id: str) -> Path | None:
             if candidate.is_dir():
                 return candidate
     return None
+
+
+# grok wraps the actual thing a person typed in <user_query>; the surrounding
+# <user_info>/<git_status>/<rules>/<image_files> text is environment context it
+# assembles itself, and showing it as a "message the user sent" is noise. These
+# were all read off real transcripts on this machine, not guessed.
+_USER_QUERY_RE = re.compile(r"<user_query>\s*(.*?)\s*</user_query>", re.DOTALL)
+_ENV_BLOCK_RE = re.compile(
+    r"<(user_info|git_status|rules|user_rules|system_reminder|image_files|"
+    r"image_compression_notice)>.*?</\1>",
+    re.DOTALL,
+)
+
+
+def _clean_user_text(text: str) -> str | None:
+    """Reduce a stored user entry to what the person actually typed.
+
+    Returns None for an entry that is *only* environment preamble (the first
+    turn's <user_info>/<git_status>/<rules> block is stored as its own user
+    record with no query in it) so the caller can drop it entirely.
+    """
+    queries = _USER_QUERY_RE.findall(text)
+    if queries:
+        return "\n\n".join(q.strip() for q in queries if q.strip()) or None
+    # No explicit query wrapper: strip any environment blocks and keep the rest,
+    # which is how plain user turns (no wrappers at all) survive untouched.
+    stripped = _ENV_BLOCK_RE.sub("", text).strip()
+    return stripped or None
 
 
 def _blocks_to_text(content: Any) -> str:
@@ -123,6 +152,14 @@ def read_history(
 
             text = _blocks_to_text(entry.get("content"))
             tool_calls = entry.get("tool_calls") or []
+
+            if kind == "user":
+                cleaned = _clean_user_text(text)
+                if cleaned is None:
+                    # Pure environment preamble, not a message anyone sent.
+                    continue
+                text = cleaned
+
             if not text and not tool_calls:
                 continue
 

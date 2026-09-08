@@ -122,6 +122,21 @@ class AcpSessionManager:
         self._fallback_seq[session_id] = seq
         return seq
 
+    def active_turn_events(self, session_id: str) -> list[dict[str, Any]]:
+        """Journalled events for the turn currently running, or [] if idle.
+
+        A fresh client has the completed transcript already; this lets it pick
+        up an in-flight turn without replaying turns it can already see.
+        """
+        job_id = self._current_job.get(session_id)
+        if job_id is None or self._journal is None:
+            return []
+        try:
+            return self._journal.events_for_job(session_id, job_id)
+        except Exception:
+            log.exception("failed to read active-turn events for %s", session_id)
+            return []
+
     def set_job(self, session_id: str, job_id: str | None) -> None:
         """Tag subsequent events with the turn that produced them."""
         if job_id is None:

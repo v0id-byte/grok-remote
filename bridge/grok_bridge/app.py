@@ -520,8 +520,20 @@ async def chat_v2(ws: WebSocket) -> None:
     try:
         # Subscribe first, then replay: an event produced between the replay
         # query and the subscription would otherwise fall through the gap.
-        after_seq = int(hello.get("afterSeq") or 0)
-        missed = store.events_after(session_id, after_seq)
+        #
+        # A fresh entry omits afterSeq: the client has just loaded the whole
+        # transcript from grok's own history (`/messages`), so replaying the
+        # journal from 0 would double every completed turn. Tail from the
+        # current high-water mark instead, and replay only an in-flight turn so
+        # a session opened mid-generation still streams. A reconnect within the
+        # same screen sends the last seq it saw and gets an exact gap fill.
+        raw_after = hello.get("afterSeq")
+        if raw_after is None:
+            after_seq = store.latest_seq(session_id)
+            missed = agents.active_turn_events(session_id)
+        else:
+            after_seq = int(raw_after)
+            missed = store.events_after(session_id, after_seq)
         await send({
             "type": "hello.ack",
             "sessionId": session_id,

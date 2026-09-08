@@ -301,6 +301,29 @@ class Store:
             out.append(event)
         return out
 
+    def events_for_job(self, session_id: str, job_id: str) -> list[dict]:
+        """Every journalled event belonging to one turn, oldest first.
+
+        Used when a client connects fresh while a turn is still running: it has
+        already loaded the completed transcript, so it wants only the in-flight
+        turn replayed, not the whole journal.
+        """
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT seq, payload FROM session_events WHERE session_id = ? "
+                "AND job_id = ? ORDER BY seq",
+                (session_id, job_id),
+            ).fetchall()
+        out = []
+        for row in rows:
+            try:
+                event = json.loads(row["payload"])
+            except json.JSONDecodeError:
+                continue
+            event["seq"] = row["seq"]
+            out.append(event)
+        return out
+
     def prune_session_events(self, session_id: str, keep: int = EVENT_KEEP_PER_SESSION) -> int:
         """Bounded retention. The journal exists to survive a dropped
         connection, not to be a permanent transcript -- grok keeps that."""

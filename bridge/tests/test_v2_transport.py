@@ -96,6 +96,40 @@ def test_a_fresh_client_replays_the_whole_journal(client, bridge, tmp_path):
         assert ws.receive_json()["data"] == "only"
 
 
+def test_a_fresh_entry_omitting_afterseq_does_not_replay_completed_turns(
+        client, bridge, tmp_path):
+    """The phone loads the transcript from grok's history; if the journal also
+    replayed those turns they would appear twice. Omitting afterSeq tails."""
+    bearer = _device(client, bridge.store)
+    sid = _session(bridge, tmp_path)
+    bridge.agents.emit(sid, {"type": "message.delta", "data": "old turn"})
+    with client.websocket_connect(
+        "/v2/chat", headers={"Authorization": f"Bearer {bearer}"}
+    ) as ws:
+        ws.send_json({"type": "hello", "sessionId": sid})  # no afterSeq
+        ack = ws.receive_json()
+        assert ack["replayed"] == 0
+        assert ack["currentSeq"] == 1
+        bridge.agents.emit(sid, {"type": "message.delta", "data": "new"})
+        assert ws.receive_json()["data"] == "new"
+
+
+def test_a_fresh_entry_still_replays_an_in_flight_turn(client, bridge, tmp_path):
+    """Opening a session while a turn is mid-generation should show that turn,
+    even though it is not yet in the completed transcript."""
+    bearer = _device(client, bridge.store)
+    sid = _session(bridge, tmp_path)
+    bridge.agents.emit(sid, {"type": "message.delta", "data": "done earlier"})
+    bridge.agents.set_job(sid, "job-live")
+    bridge.agents.emit(sid, {"type": "message.delta", "data": "streaming now"})
+    with client.websocket_connect(
+        "/v2/chat", headers={"Authorization": f"Bearer {bearer}"}
+    ) as ws:
+        ws.send_json({"type": "hello", "sessionId": sid})  # no afterSeq
+        assert ws.receive_json()["replayed"] == 1
+        assert ws.receive_json()["data"] == "streaming now"
+
+
 def test_live_events_stream_after_the_replay(client, bridge, tmp_path):
     bearer = _device(client, bridge.store)
     sid = _session(bridge, tmp_path)

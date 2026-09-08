@@ -133,6 +133,13 @@ def find_repos(refresh: bool = False) -> list[dict[str, Any]]:
             return
         for child in children:
             try:
+                # Dot-directories are tool state, not projects. ~/.grok holds a
+                # marketplace cache full of checked-out plugins, and other tools
+                # keep agent definitions the same way -- all of them are real git
+                # repositories, and none of them is something to open a session
+                # in. Without this the picker's first page is hash-named noise.
+                if child.name.startswith("."):
+                    continue
                 if child.is_dir(follow_symlinks=False) and child.name not in _SKIP_DIRS:
                     walk(child, depth + 1)
             except OSError:

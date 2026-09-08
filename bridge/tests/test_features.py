@@ -123,6 +123,34 @@ def test_history_filters_grok_internal_entries(tmp_path, monkeypatch):
     assert page["total"] == 3
 
 
+def test_history_unwraps_user_query_and_drops_env_preamble(tmp_path, monkeypatch):
+    """grok stores the first turn's <user_info>/<git_status>/<rules> block as its
+    own user record and wraps every real prompt in <user_query>. Neither the
+    preamble nor the wrapper tags should reach the phone."""
+    from grok_bridge import grok_disk
+    session_dir = tmp_path / "s"
+    session_dir.mkdir()
+    (session_dir / "chat_history.jsonl").write_text("\n".join(json.dumps(e) for e in [
+        {"type": "user", "content":
+            "<user_info>\nOS: macos\n</user_info>\n<git_status>\nclean\n</git_status>"},
+        {"type": "user", "content":
+            "<user_query>\nRead notes.txt and tell me the magic word.\n</user_query>"},
+        {"type": "assistant", "content": "The magic word is ELDERBERRY_9042."},
+        {"type": "user", "content":
+            "<image_files>\nx\n</image_files>\n<user_query>\nwhat colour?\n</user_query>"},
+        {"type": "user", "content": "plain follow-up with no wrapper"},
+    ]) + "\n")
+    monkeypatch.setattr(grok_disk, "session_dir", lambda cwd, sid: session_dir)
+
+    page = grok_disk.read_history("/x", "s")
+    assert [m["role"] for m in page["messages"]] == \
+        ["user", "assistant", "user", "user"]
+    assert page["messages"][0]["text"] == "Read notes.txt and tell me the magic word."
+    assert page["messages"][2]["text"] == "what colour?"
+    assert page["messages"][3]["text"] == "plain follow-up with no wrapper"
+    assert "<user_info>" not in json.dumps(page)
+
+
 def test_history_pagination_is_stable(tmp_path, monkeypatch):
     from grok_bridge import grok_disk
     session_dir = tmp_path / "s"
