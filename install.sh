@@ -11,13 +11,10 @@
 #      reliably; System Settings > Battery/Lock Screen)
 #   5. Prints a one-time pairing QR code for the iOS app
 #
-# What it does NOT automate (needs a one-time manual step in the Cloudflare
-# dashboard -- Access application/policy setup touches your Zero Trust org
-# and is safer done there than scripted blind against a live account):
-#   - Creating the Cloudflare Access application + Service Token for
-#     $HOSTNAME. Instructions are printed at the end; paste the resulting
-#     Client ID/Secret back into this script's prompt and it writes them
-#     into ios/GrokRemote/Info.plist for you.
+# Authentication is the Bridge's own per-device token, nothing at the edge:
+# there is deliberately no Cloudflare Access application or Service Token, so
+# no edge secret is ever written into the app. The tunnel just carries traffic;
+# the token in the pairing QR is the only credential. See plan v2 §0.1.
 #
 # Usage: ./install.sh <hostname, e.g. grok-remote.void1211.com>
 
