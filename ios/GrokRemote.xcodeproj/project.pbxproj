@@ -8,41 +8,70 @@
 
 /* Begin PBXBuildFile section */
 		018BA1ED80E0F92578E868F2 /* KeychainStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = E157DCB1724F0A9B380232A4 /* KeychainStore.swift */; };
-		4B9E1F79F8EB9EB3CB27BBA8 /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 60FFE2B9927D2FFD81A31839 /* ChatView.swift */; };
+		157C2D3C4F6187A71E35E1C1 /* SessionsListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D33AF4B7AEC3B283279B729 /* SessionsListView.swift */; };
+		35A3A38485AE8F9A6CD7B66E /* QRScannerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1F58E0007721E5D5121CD8A5 /* QRScannerView.swift */; };
+		3755873F515E9E0FD1AB15BC /* Components.swift in Sources */ = {isa = PBXBuildFile; fileRef = 32CD8C13D1C5AC09B6F4DD5C /* Components.swift */; };
 		57A1D35B8501EE6615A80D4D /* AppState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2F06C7367424640BE613D80E /* AppState.swift */; };
 		5DDC8D9E1512094BA68FE293 /* GrokRemoteApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = FEBDC5458F966426BAB40650 /* GrokRemoteApp.swift */; };
+		5FA3ACDA5C1AB1DD8ED4FC21 /* MarkdownBlocks.swift in Sources */ = {isa = PBXBuildFile; fileRef = 36752718E945EB4131AB4383 /* MarkdownBlocks.swift */; };
+		66F6ABCCB84D9824AA97B543 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C9D0718C4CB7920F0F69E16F /* SettingsView.swift */; };
 		803758291B296F5A08167594 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = 191D60523EA0E7555A474434 /* Models.swift */; };
-		97A94DAE6484999463E112A6 /* SessionsListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 58011B1CDDC591370DB14F12 /* SessionsListView.swift */; };
-		A2ABC054208F800E8336AF83 /* PairingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CF0FC4C46A595CF4E27D685 /* PairingView.swift */; };
+		84BC1C02F0184C3E3EC182E0 /* MarkdownView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 67F8DC19B851B4290A5C9D32 /* MarkdownView.swift */; };
+		8A66444F4521EBC3C44EE6E5 /* CommandPaletteView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 24381D954AB41A9C37788BDE /* CommandPaletteView.swift */; };
+		94739CE7954D55D916BD5AC8 /* PairingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DAFEC3CC1513EBCCA758A714 /* PairingView.swift */; };
+		95357C53BC1F9BC9FEDA853C /* MessageView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0853E7986D6B95437AFAFFAB /* MessageView.swift */; };
+		ADC7203018A25E96721EDADB /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 26194C127900A1E23DB75ECD /* ChatView.swift */; };
+		B691EEBB93C7DE2BB6624740 /* ProjectPickerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 179A822528C1851E6E3E68A0 /* ProjectPickerView.swift */; };
 		C8F54D90975810EA49A14688 /* BridgeClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 11CC67651E14B378F1F8F240 /* BridgeClient.swift */; };
+		DB51C4A5A81D01EE0EFA170A /* DesignSystem.swift in Sources */ = {isa = PBXBuildFile; fileRef = C8F77934354D9C9736A8600F /* DesignSystem.swift */; };
+		E6679ABC2D950894DBAC062E /* ChatModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2F2B60E1B0F24EFBF302E40C /* ChatModel.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		0853E7986D6B95437AFAFFAB /* MessageView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessageView.swift; sourceTree = "<group>"; };
 		11CC67651E14B378F1F8F240 /* BridgeClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeClient.swift; sourceTree = "<group>"; };
+		179A822528C1851E6E3E68A0 /* ProjectPickerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectPickerView.swift; sourceTree = "<group>"; };
 		191D60523EA0E7555A474434 /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
-		23C7D2AF27179DA89B5E8A86 /* GrokRemote.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = GrokRemote.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		2CF0FC4C46A595CF4E27D685 /* PairingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PairingView.swift; sourceTree = "<group>"; };
+		1F58E0007721E5D5121CD8A5 /* QRScannerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QRScannerView.swift; sourceTree = "<group>"; };
+		23C7D2AF27179DA89B5E8A86 /* GrokRemote.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = GrokRemote.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		24381D954AB41A9C37788BDE /* CommandPaletteView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CommandPaletteView.swift; sourceTree = "<group>"; };
+		26194C127900A1E23DB75ECD /* ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatView.swift; sourceTree = "<group>"; };
 		2F06C7367424640BE613D80E /* AppState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppState.swift; sourceTree = "<group>"; };
-		58011B1CDDC591370DB14F12 /* SessionsListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionsListView.swift; sourceTree = "<group>"; };
-		60FFE2B9927D2FFD81A31839 /* ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatView.swift; sourceTree = "<group>"; };
+		2F2B60E1B0F24EFBF302E40C /* ChatModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatModel.swift; sourceTree = "<group>"; };
+		32CD8C13D1C5AC09B6F4DD5C /* Components.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Components.swift; sourceTree = "<group>"; };
+		36752718E945EB4131AB4383 /* MarkdownBlocks.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownBlocks.swift; sourceTree = "<group>"; };
+		4D33AF4B7AEC3B283279B729 /* SessionsListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionsListView.swift; sourceTree = "<group>"; };
+		67F8DC19B851B4290A5C9D32 /* MarkdownView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownView.swift; sourceTree = "<group>"; };
 		6AC59418CC2D96E8985B1254 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		C8F77934354D9C9736A8600F /* DesignSystem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesignSystem.swift; sourceTree = "<group>"; };
+		C9D0718C4CB7920F0F69E16F /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
+		DAFEC3CC1513EBCCA758A714 /* PairingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PairingView.swift; sourceTree = "<group>"; };
 		E157DCB1724F0A9B380232A4 /* KeychainStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainStore.swift; sourceTree = "<group>"; };
 		FEBDC5458F966426BAB40650 /* GrokRemoteApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GrokRemoteApp.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
+		244129695209D2A8372A86CA /* Markdown */ = {
+			isa = PBXGroup;
+			children = (
+				36752718E945EB4131AB4383 /* MarkdownBlocks.swift */,
+				67F8DC19B851B4290A5C9D32 /* MarkdownView.swift */,
+			);
+			path = Markdown;
+			sourceTree = "<group>";
+		};
 		5518EA6A8C878EEFDE37056B /* GrokRemote */ = {
 			isa = PBXGroup;
 			children = (
 				2F06C7367424640BE613D80E /* AppState.swift */,
 				11CC67651E14B378F1F8F240 /* BridgeClient.swift */,
-				60FFE2B9927D2FFD81A31839 /* ChatView.swift */,
 				FEBDC5458F966426BAB40650 /* GrokRemoteApp.swift */,
 				6AC59418CC2D96E8985B1254 /* Info.plist */,
 				E157DCB1724F0A9B380232A4 /* KeychainStore.swift */,
 				191D60523EA0E7555A474434 /* Models.swift */,
-				2CF0FC4C46A595CF4E27D685 /* PairingView.swift */,
-				58011B1CDDC591370DB14F12 /* SessionsListView.swift */,
+				E794D6B6FCB2FA57E41D73B6 /* Design */,
+				244129695209D2A8372A86CA /* Markdown */,
+				C94AEA0676052789066FB2AA /* Views */,
 			);
 			path = GrokRemote;
 			sourceTree = "<group>";
@@ -55,12 +84,37 @@
 			);
 			sourceTree = "<group>";
 		};
+		C94AEA0676052789066FB2AA /* Views */ = {
+			isa = PBXGroup;
+			children = (
+				2F2B60E1B0F24EFBF302E40C /* ChatModel.swift */,
+				26194C127900A1E23DB75ECD /* ChatView.swift */,
+				24381D954AB41A9C37788BDE /* CommandPaletteView.swift */,
+				32CD8C13D1C5AC09B6F4DD5C /* Components.swift */,
+				0853E7986D6B95437AFAFFAB /* MessageView.swift */,
+				DAFEC3CC1513EBCCA758A714 /* PairingView.swift */,
+				179A822528C1851E6E3E68A0 /* ProjectPickerView.swift */,
+				1F58E0007721E5D5121CD8A5 /* QRScannerView.swift */,
+				4D33AF4B7AEC3B283279B729 /* SessionsListView.swift */,
+				C9D0718C4CB7920F0F69E16F /* SettingsView.swift */,
+			);
+			path = Views;
+			sourceTree = "<group>";
+		};
 		E22E84604317B73089CCE295 /* Products */ = {
 			isa = PBXGroup;
 			children = (
 				23C7D2AF27179DA89B5E8A86 /* GrokRemote.app */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		E794D6B6FCB2FA57E41D73B6 /* Design */ = {
+			isa = PBXGroup;
+			children = (
+				C8F77934354D9C9736A8600F /* DesignSystem.swift */,
+			);
+			path = Design;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -91,6 +145,11 @@
 			attributes = {
 				BuildIndependentTargetsInParallel = YES;
 				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+					8268C83EE87BBFB6D3438BF0 = {
+						DevelopmentTeam = "";
+					};
+				};
 			};
 			buildConfigurationList = A5FA637952C851AA26529BA9 /* Build configuration list for PBXProject "GrokRemote" */;
 			developmentRegion = en;
@@ -118,12 +177,22 @@
 			files = (
 				57A1D35B8501EE6615A80D4D /* AppState.swift in Sources */,
 				C8F54D90975810EA49A14688 /* BridgeClient.swift in Sources */,
-				4B9E1F79F8EB9EB3CB27BBA8 /* ChatView.swift in Sources */,
+				E6679ABC2D950894DBAC062E /* ChatModel.swift in Sources */,
+				ADC7203018A25E96721EDADB /* ChatView.swift in Sources */,
+				8A66444F4521EBC3C44EE6E5 /* CommandPaletteView.swift in Sources */,
+				3755873F515E9E0FD1AB15BC /* Components.swift in Sources */,
+				DB51C4A5A81D01EE0EFA170A /* DesignSystem.swift in Sources */,
 				5DDC8D9E1512094BA68FE293 /* GrokRemoteApp.swift in Sources */,
 				018BA1ED80E0F92578E868F2 /* KeychainStore.swift in Sources */,
+				5FA3ACDA5C1AB1DD8ED4FC21 /* MarkdownBlocks.swift in Sources */,
+				84BC1C02F0184C3E3EC182E0 /* MarkdownView.swift in Sources */,
+				95357C53BC1F9BC9FEDA853C /* MessageView.swift in Sources */,
 				803758291B296F5A08167594 /* Models.swift in Sources */,
-				A2ABC054208F800E8336AF83 /* PairingView.swift in Sources */,
-				97A94DAE6484999463E112A6 /* SessionsListView.swift in Sources */,
+				94739CE7954D55D916BD5AC8 /* PairingView.swift in Sources */,
+				B691EEBB93C7DE2BB6624740 /* ProjectPickerView.swift in Sources */,
+				35A3A38485AE8F9A6CD7B66E /* QRScannerView.swift in Sources */,
+				157C2D3C4F6187A71E35E1C1 /* SessionsListView.swift in Sources */,
+				66F6ABCCB84D9824AA97B543 /* SettingsView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -258,7 +327,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
-				DEVELOPMENT_TEAM = C58WLH687Z;
+				DEVELOPMENT_TEAM = "";
 				INFOPLIST_FILE = GrokRemote/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -276,7 +345,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
-				DEVELOPMENT_TEAM = C58WLH687Z;
+				DEVELOPMENT_TEAM = "";
 				INFOPLIST_FILE = GrokRemote/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",

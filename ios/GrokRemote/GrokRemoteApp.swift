@@ -8,6 +8,7 @@ struct GrokRemoteApp: App {
         WindowGroup {
             RootView()
                 .environment(appState)
+                .tint(DS.Color.accent)
         }
     }
 }
@@ -16,10 +17,14 @@ struct RootView: View {
     @Environment(AppState.self) private var appState
 
     var body: some View {
-        if appState.isPaired {
-            SessionsListView()
-        } else {
-            PairingView()
+        ZStack {
+            DS.Color.bg.ignoresSafeArea()
+            if appState.isPaired {
+                SessionsListView()
+            } else {
+                PairingView()
+            }
         }
+        .animation(DS.Motion.screen, value: appState.isPaired)
     }
 }
