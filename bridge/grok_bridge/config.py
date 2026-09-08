@@ -73,5 +73,26 @@ ALLOWED_UPLOAD_EXTENSIONS = {".png", ".jpg", ".jpeg", ".pdf", ".txt", ".md", ".j
 DEFAULT_MODEL = "qwen3.8-27b-uncensored"
 DEFAULT_REASONING_EFFORT = "high"
 
+# --- pairing / auth hardening (plan v2 §0.2) ---------------------------------
+#
+# Cloudflare Access was removed (see plan v2 §0.1): an Access Service Token is a
+# machine-to-machine client secret and cannot be shipped inside an app bundle.
+# That collapses two identity layers into one, so the Bridge's own pairing flow
+# is now the ONLY thing between the public tunnel and an agent that can run
+# shell commands. Hence: pairing tokens expire, pairing is rate limited, and the
+# endpoint hides itself when there is nothing to redeem.
+
+# A pairing token is meant to be typed/scanned within a minute of install.sh
+# printing it. Before this, tokens never expired -- a QR screenshot or a stale
+# terminal scrollback from months ago stayed a valid credential forever.
+PAIRING_TOKEN_TTL_SECONDS = 600  # 10 minutes
+
+# Failed-auth throttling, per client IP. Deliberately coarse: this is a
+# single-user service, so any real traffic pattern stays far below these.
+AUTH_FAIL_WINDOW_SECONDS = 300
+AUTH_FAIL_MAX = 10          # failures per window before a client is refused
+PAIR_ATTEMPT_WINDOW_SECONDS = 300
+PAIR_ATTEMPT_MAX = 5
+
 BRIDGE_DIR.mkdir(parents=True, exist_ok=True)
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)

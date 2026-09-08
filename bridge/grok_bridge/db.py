@@ -61,6 +61,15 @@ CREATE TABLE IF NOT EXISTS pairing_tokens (
 PREVIEW_LEN = 200
 
 
+def _ensure_column(conn: sqlite3.Connection, table: str, col: str, decl: str) -> None:
+    """Additive migration. SQLite has no ADD COLUMN IF NOT EXISTS, and this
+    schema predates any versioning, so existing databases are upgraded by
+    checking table_info rather than by a migration number."""
+    cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+    if col not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+
+
 def _connect(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -71,8 +80,26 @@ def _connect(db_path: Path) -> sqlite3.Connection:
 class Store:
     def __init__(self, db_path: Path = config.DB_PATH):
         self.db_path = db_path
+        # The database holds device secrets in the clear (and, later, permission
+        # payloads that can contain shell commands and file contents). It is not
+        # ordinary metadata -- keep it owner-only.
+        try:
+            self.db_path.touch(exist_ok=True)
+            self.db_path.chmod(0o600)
+        except OSError:
+            pass
         with _connect(self.db_path) as conn:
             conn.executescript(SCHEMA)
+            _ensure_column(conn, "pairing_tokens", "expires_at", "REAL")
+            # Backfill rows written before the TTL existed. Without this they
+            # keep expires_at = NULL and stay redeemable forever, which is the
+            # exact hole the TTL was added to close -- this database really did
+            # contain a 22-day-old unredeemed token still accepted as valid.
+            conn.execute(
+                "UPDATE pairing_tokens SET expires_at = created_at + ? "
+                "WHERE expires_at IS NULL",
+                (config.PAIRING_TOKEN_TTL_SECONDS,),
+            )
             # Bridge just (re)started: any job still marked "running" belongs
             # to a process that no longer exists. Don't let a client sit
             # staring at "generating..." forever.
@@ -187,14 +214,40 @@ class Store:
 
     # -- devices -------------------------------------------------------------
 
-    def create_pairing_token(self) -> str:
+    def create_pairing_token(self, ttl_seconds: float | None = None) -> str:
         token = uuid.uuid4().hex
+        now = time.time()
+        ttl = config.PAIRING_TOKEN_TTL_SECONDS if ttl_seconds is None else ttl_seconds
         with self._conn() as conn:
             conn.execute(
-                "INSERT INTO pairing_tokens (token, created_at) VALUES (?, ?)",
-                (token, time.time()),
+                "INSERT INTO pairing_tokens (token, created_at, expires_at) VALUES (?, ?, ?)",
+                (token, now, now + ttl),
             )
         return token
+
+    def purge_expired_pairing_tokens(self) -> int:
+        """Unredeemed tokens past their TTL are dead weight and, if they were
+        ever to leak, a standing credential. Drop them rather than merely
+        refusing them."""
+        with self._conn() as conn:
+            cur = conn.execute(
+                "DELETE FROM pairing_tokens WHERE used_at IS NULL "
+                "AND expires_at IS NOT NULL AND expires_at < ?",
+                (time.time(),),
+            )
+        return cur.rowcount
+
+    def has_redeemable_pairing_token(self) -> bool:
+        """Whether any token is currently redeemable. With Access gone, /v1/pair
+        is directly internet-facing; when there is nothing to redeem it should
+        look like it does not exist rather than advertise itself."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM pairing_tokens WHERE used_at IS NULL "
+                "AND (expires_at IS NULL OR expires_at >= ?) LIMIT 1",
+                (time.time(),),
+            ).fetchone()
+        return row is not None
 
     def redeem_pairing_token(self, token: str, device_name: str = "iPhone") -> tuple[str, str] | None:
         """Consume a one-time pairing token, mint a device (id, secret). None if invalid/used."""
@@ -203,6 +256,9 @@ class Store:
                 "SELECT * FROM pairing_tokens WHERE token = ?", (token,)
             ).fetchone()
             if row is None or row["used_at"] is not None:
+                return None
+            expires_at = row["expires_at"] if "expires_at" in row.keys() else None
+            if expires_at is not None and expires_at < time.time():
                 return None
             conn.execute(
                 "UPDATE pairing_tokens SET used_at = ? WHERE token = ?",
