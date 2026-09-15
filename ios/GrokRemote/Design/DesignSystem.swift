@@ -16,7 +16,7 @@
 //  纪律（AGENTS.md 会引用这里）：
 //    · 视图**禁止**直接写 `.gray / .white / .black / Color(red:…)`，一律走 `DS.Color.*`
 //    · monospace **只给数字**（`.dsMetric()`），标签永远不用 monospace、不大写、不加字距
-//    · Liquid Glass 只存在于 `DSPrimaryButton` 与 `DSBackButton` 两个组件里，别处不许用
+//    · 主按钮与返回按钮是唯一允许使用特殊按钮装饰的组件，别处不许扩散
 //    · 全项目零 `repeatForever`、零 `.shadow`、零 emoji（SF Symbols 用 `.monochrome`）
 //
 
@@ -344,8 +344,7 @@ struct DSButtonStyle: ButtonStyle {
     }
 }
 
-/// 主按钮 —— Liquid Glass 的两个合法落点之一。
-/// iOS 26+ 用 `.glassProminent`，否则 accent 实底 + spring。
+/// 主按钮 —— accent 实底 + spring。
 struct DSPrimaryButton: View {
     let title: String
     var systemImage: String? = nil
@@ -364,26 +363,18 @@ struct DSPrimaryButton: View {
             .frame(maxWidth: .infinity)
             .frame(minHeight: DS.controlHeight)
         }
-        .modifier(DSPrimaryGlass())
+        .modifier(DSPrimaryButtonDecoration())
         .disabled(!isEnabled)
     }
 }
 
-private struct DSPrimaryGlass: ViewModifier {
+private struct DSPrimaryButtonDecoration: ViewModifier {
     func body(content: Content) -> some View {
-        if #available(iOS 26.0, *) {
-            content
-                .buttonStyle(.glassProminent)
-                .buttonBorderShape(.roundedRectangle(radius: DS.Radius.button))
-                .tint(DS.Color.accent)
-                .foregroundStyle(DS.Color.onAccent)
-        } else {
-            content.buttonStyle(DSButtonStyle(kind: .primary))
-        }
+        content.buttonStyle(DSButtonStyle(kind: .primary))
     }
 }
 
-/// 返回键 —— Liquid Glass 的另一个合法落点。
+/// 返回键 —— surface 实底 + 细边框。
 struct DSBackButton: View {
     var accessibilityLabel: String = "Back"
     let action: () -> Void
@@ -397,22 +388,16 @@ struct DSBackButton: View {
                 .frame(width: DS.minTapTarget, height: DS.minTapTarget)
                 .contentShape(Rectangle())
         }
-        .modifier(DSBackGlass())
+        .modifier(DSBackButtonDecoration())
         .accessibilityLabel(accessibilityLabel)
     }
 }
 
-private struct DSBackGlass: ViewModifier {
+private struct DSBackButtonDecoration: ViewModifier {
     func body(content: Content) -> some View {
-        if #available(iOS 26.0, *) {
-            content
-                .buttonStyle(.plain)
-                .glassEffect(.regular.interactive(), in: .rect(cornerRadius: DS.Radius.button))
-        } else {
-            content
-                .buttonStyle(.plain)
-                .background(DS.Color.surface)
-                .dsHairline()
-        }
+        content
+            .buttonStyle(.plain)
+            .background(DS.Color.surface)
+            .dsHairline()
     }
 }
