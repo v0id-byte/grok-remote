@@ -14,6 +14,7 @@ struct ChatView: View {
     @State private var pendingAttachments: [String] = []
     @State private var isUploading = false
     @State private var showMenu = false
+    @State private var showSessionSettings = false
 
     var body: some View {
         DSScreen(
@@ -40,7 +41,11 @@ struct ChatView: View {
         .background(DS.Color.bg)
         .toolbar(.hidden, for: .navigationBar)
         .navigationBarBackButtonHidden(true)
-        .task { await model.start(client: appState.client, session: session) }
+        .task {
+            await model.start(client: appState.client, session: session,
+                              defaultModel: session.isNew ? appState.defaultModel.nilIfEmpty : nil,
+                              defaultEffort: session.isNew ? appState.defaultEffort.nilIfEmpty : nil)
+        }
         .onDisappear { model.stop() }
         .onChange(of: draft) { _, value in
             withAnimation(DS.Motion.settle) {
@@ -52,8 +57,14 @@ struct ChatView: View {
             Task { await upload(item) }
         }
         .confirmationDialog("Session", isPresented: $showMenu) {
-            Button("Clear conversation") { runNamedCommand("clear", nil) }
-            Button("Show working directory") { runNamedCommand("cwd", nil) }
+            Button("Session settings") { showSessionSettings = true }
+            if model.canRun {
+                Button("Clear conversation") { runNamedCommand("clear", nil) }
+            }
+            Button("Show working directory") { showSessionSettings = true }
+        }
+        .sheet(isPresented: $showSessionSettings) {
+            SessionSettingsView(model: model)
         }
     }
 
@@ -143,6 +154,12 @@ struct ChatView: View {
 
     private var inputBar: some View {
         VStack(alignment: .leading, spacing: DS.Space.s) {
+            if !model.canRun {
+                Text(model.readOnlyReason ?? "This session is read-only.")
+                    .font(DS.Font.footnote)
+                    .foregroundStyle(DS.Color.textSecondary)
+                    .padding(.horizontal, DS.Space.l)
+            }
             if !pendingAttachments.isEmpty || isUploading {
                 HStack(spacing: DS.Space.s) {
                     if isUploading { ProgressView().controlSize(.mini).tint(DS.Color.accent) }
@@ -170,6 +187,7 @@ struct ChatView: View {
                         .frame(width: DS.minTapTarget, height: DS.minTapTarget)
                 }
                 .accessibilityLabel("Attach an image")
+                .disabled(!model.canRun)
 
                 TextField("Message, or / for commands", text: $draft, axis: .vertical)
                     .font(DS.Font.body)
@@ -179,6 +197,7 @@ struct ChatView: View {
                     .padding(.vertical, DS.Space.s)
                     .background(DS.Color.surface)
                     .dsHairline()
+                    .disabled(!model.canRun)
 
                 if model.isStreaming {
                     DSIconButton(systemName: DS.Icon.stop,
@@ -201,7 +220,9 @@ struct ChatView: View {
     }
 
     private var canSend: Bool {
-        !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && model.isConnected
+        model.canRun
+            && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && model.isConnected
     }
 
     // MARK: Actions
@@ -215,8 +236,8 @@ struct ChatView: View {
         showPalette = false
         Task {
             await model.send(text: text,
-                             model: session.model ?? appState.defaultModel.nilIfEmpty,
-                             effort: appState.defaultEffort.nilIfEmpty,
+                             model: model.currentModel,
+                             effort: model.currentEffort,
                              attachments: attachments)
         }
     }
@@ -248,4 +269,126 @@ struct ChatView: View {
 
 private extension String {
     var nilIfEmpty: String? { isEmpty ? nil : self }
+}
+
+struct SessionSettingsView: View {
+    let model: ChatModel
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var selectedModel = ""
+    @State private var selectedEffort = ""
+
+    var body: some View {
+        DSScreen(
+            title: "Session settings",
+            subtitle: "Applies to this conversation",
+            leading: AnyView(DSBackButton { dismiss() })) {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: DS.Space.l) {
+                        workingDirectory
+                        configuration
+                        if let error = model.errorBanner {
+                            Text(error)
+                                .font(DS.Font.footnote)
+                                .foregroundStyle(DS.Color.danger)
+                        }
+                    }
+                    .padding(DS.Space.l)
+                }
+            }
+            .background(DS.Color.bg)
+            .task {
+                selectedModel = model.currentModel ?? ""
+                selectedEffort = model.currentEffort ?? ""
+            }
+            .onChange(of: model.currentModel) { _, value in
+                if let value { selectedModel = value }
+            }
+            .onChange(of: model.currentEffort) { _, value in
+                selectedEffort = value ?? ""
+            }
+    }
+
+    private var workingDirectory: some View {
+        VStack(alignment: .leading, spacing: DS.Space.s) {
+            DSSectionLabel(text: "Working directory")
+            Text(model.workingDirectory)
+                .font(DS.Font.code)
+                .foregroundStyle(DS.Color.text)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+            if !model.canRun {
+                DSStatusLine(
+                    text: model.readOnlyReason ?? "History is read-only.",
+                    status: .warning)
+            }
+        }
+        .dsCard(model.canRun ? .idle : .warning)
+    }
+
+    private var configuration: some View {
+        VStack(alignment: .leading, spacing: DS.Space.s) {
+            DSSectionLabel(text: "Model")
+            if model.modelOptions.isEmpty {
+                Text("No model catalogue available.")
+                    .font(DS.Font.footnote)
+                    .foregroundStyle(DS.Color.textSecondary)
+            } else {
+                Picker("Model", selection: $selectedModel) {
+                    ForEach(model.modelOptions) { option in
+                        Text(option.name).tag(option.id)
+                    }
+                }
+                .pickerStyle(.menu)
+                .tint(DS.Color.accent)
+                .disabled(model.isUpdatingConfig || model.isStreaming || !model.canRun)
+                .onChange(of: selectedModel) { _, value in
+                    guard !value.isEmpty, value != model.currentModel,
+                          !model.isUpdatingConfig, !model.isStreaming else { return }
+                    Task {
+                        if !(await model.updateModel(value)) {
+                            selectedModel = model.currentModel ?? ""
+                            selectedEffort = model.currentEffort ?? ""
+                        }
+                    }
+                }
+            }
+
+            DSSectionLabel(text: "Reasoning effort")
+            Picker("Reasoning effort", selection: $selectedEffort) {
+                Text("Model default").tag("")
+                ForEach(effortOptions, id: \.self) { effort in
+                    Text(effort.capitalized).tag(effort)
+                }
+            }
+            .pickerStyle(.menu)
+            .tint(DS.Color.accent)
+            .disabled(effortOptions.isEmpty || model.isUpdatingConfig
+                      || model.isStreaming || !model.canRun)
+            .onChange(of: selectedEffort) { _, value in
+                guard value != model.currentEffort,
+                      !model.isUpdatingConfig, !model.isStreaming, model.canRun else { return }
+                Task {
+                    if !(await model.updateEffort(value.isEmpty ? nil : value)) {
+                        selectedEffort = model.currentEffort ?? ""
+                    }
+                }
+            }
+
+            if model.isUpdatingConfig {
+                DSStatusLine(text: "Updating session…", status: .active)
+            } else {
+                Text("Changing reasoning effort restarts the agent and reloads the "
+                     + "same conversation.")
+                    .font(DS.Font.footnote)
+                    .foregroundStyle(DS.Color.textTertiary)
+            }
+        }
+        .dsCard()
+        .disabled(!model.canRun || model.isStreaming)
+    }
+
+    private var effortOptions: [String] {
+        model.modelOptions.first { $0.id == selectedModel }?.reasoningEfforts ?? []
+    }
 }

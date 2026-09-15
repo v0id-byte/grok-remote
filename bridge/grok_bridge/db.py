@@ -25,7 +25,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     cwd TEXT NOT NULL,
     title TEXT,
     created_at REAL NOT NULL,
-    last_active_at REAL NOT NULL
+    last_active_at REAL NOT NULL,
+    source TEXT NOT NULL DEFAULT 'bridge'
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -110,6 +111,7 @@ class Store:
             _ensure_column(conn, "sessions", "model", "TEXT")
             _ensure_column(conn, "sessions", "reasoning_effort", "TEXT")
             _ensure_column(conn, "sessions", "permission_mode", "TEXT")
+            _ensure_column(conn, "sessions", "source", "TEXT NOT NULL DEFAULT 'bridge'")
             # Backfill rows written before the TTL existed. Without this they
             # keep expires_at = NULL and stay redeemable forever, which is the
             # exact hole the TTL was added to close -- this database really did
@@ -149,11 +151,62 @@ class Store:
             )
         return session_id
 
+    def upsert_discovered_session(
+        self,
+        *,
+        cwd: str,
+        grok_session_id: str,
+        title: str | None = None,
+        model: str | None = None,
+        created_at: float | None = None,
+        last_active_at: float | None = None,
+    ) -> str:
+        """Index one session found in Grok's on-disk history.
+
+        The Bridge id is deliberately separate from Grok's id: Grok owns the
+        transcript and may mint its id independently of this service.  Existing
+        local titles/models win on refresh so a phone-side edit is not undone by
+        stale summary metadata.
+        """
+        now = time.time()
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM sessions WHERE cwd = ? AND grok_session_id = ? "
+                "ORDER BY last_active_at DESC LIMIT 1",
+                (cwd, grok_session_id),
+            ).fetchone()
+            if row is not None:
+                updates: dict[str, object] = {}
+                if not row["title"] and title:
+                    updates["title"] = title
+                if ("model" in row.keys() and not row["model"] and model):
+                    updates["model"] = model
+                if last_active_at is not None and last_active_at > row["last_active_at"]:
+                    updates["last_active_at"] = last_active_at
+                if updates:
+                    assignments = ", ".join(f"{key} = ?" for key in updates)
+                    conn.execute(
+                        f"UPDATE sessions SET {assignments} WHERE id = ?",
+                        (*updates.values(), row["id"]),
+                    )
+                return row["id"]
+
+            bridge_id = str(uuid.uuid4())
+            created = created_at if created_at is not None else now
+            active = last_active_at if last_active_at is not None else created
+            conn.execute(
+                "INSERT INTO sessions "
+                "(id, grok_session_id, cwd, title, created_at, last_active_at, model, source) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'discovered')",
+                (bridge_id, grok_session_id, cwd, title, created, active, model),
+            )
+            return bridge_id
+
     def update_session(self, session_id: str, **fields) -> bool:
         """Patch a session's mutable columns. Unknown keys are ignored rather
         than trusted into an SQL string."""
         allowed = {"title", "model", "reasoning_effort", "permission_mode",
-                   "grok_session_id", "cwd"}
+                   "grok_session_id", "cwd", "source"}
         sets = {k: v for k, v in fields.items() if k in allowed}
         if not sets:
             return False

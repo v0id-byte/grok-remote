@@ -158,6 +158,7 @@ class AcpSessionManager:
         cwd: Path,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        resume: bool | None = None,
     ) -> AcpProcess:
         """Return a live agent for this session, starting one if needed."""
         proc = self._procs.get(session_id)
@@ -178,9 +179,10 @@ class AcpSessionManager:
                 # A session that has run before is resumed rather than
                 # recreated, so a reaped or crashed agent comes back with its
                 # context. The Phase 0 spike confirmed session/load restores it
-                # losslessly. "Has run before" survives a Bridge restart by
-                # asking the journal, not an in-memory set.
-                resume=self._has_history(session_id),
+                # losslessly. Callers that know they are opening an imported
+                # Grok session pass resume=True because it has no Bridge journal
+                # yet; otherwise the journal remains the compatibility default.
+                resume=(self._has_history(session_id) if resume is None else resume),
             )
 
     async def _spawn(
@@ -319,6 +321,7 @@ class AcpSessionManager:
         blocks: list[dict[str, Any]],
         model: str | None = None,
         reasoning_effort: str | None = None,
+        resume: bool | None = None,
     ) -> dict[str, Any]:
         proc = await self.get(
             session_id=session_id,
@@ -326,6 +329,7 @@ class AcpSessionManager:
             cwd=cwd,
             model=model,
             reasoning_effort=reasoning_effort,
+            resume=resume,
         )
         if model and proc.model != model:
             await proc.set_model(model)
@@ -356,6 +360,10 @@ class AcpSessionManager:
         reasoning_effort: str | None = None,
     ) -> AcpProcess:
         """Stop and reload a session's agent, preserving conversation context."""
+        current = self._procs.get(session_id)
+        if current is not None and current.alive \
+                and current.state is SessionState.RUNNING:
+            raise AgentBusy("cannot restart while a turn is running")
         old = self._procs.pop(session_id, None)
         if old:
             await old.cancel()

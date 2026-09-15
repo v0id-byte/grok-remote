@@ -83,10 +83,13 @@ struct ChatSession: Codable, Identifiable, Hashable {
     var messageCount: Int?
     var headBranch: String?
     var lastTurnSummary: String?
+    var canRun: Bool?
+    var readOnlyReason: String?
+    var isNew: Bool = false
 
     enum CodingKeys: String, CodingKey {
         case id, cwd, title, model, state, cwdExists, messageCount, headBranch
-        case lastTurnSummary, reasoningEffort
+        case lastTurnSummary, reasoningEffort, canRun, readOnlyReason
         case createdAt = "created_at"
         case lastActiveAt = "last_active_at"
         case lastMessagePreview = "last_message_preview"
@@ -98,6 +101,19 @@ struct ChatSession: Codable, Identifiable, Hashable {
 }
 
 struct SessionsResponse: Codable { var sessions: [ChatSession] }
+
+struct SessionConfig: Codable, Hashable {
+    var model: String?
+    var reasoningEffort: String?
+    var reasoningEffortConfigured: Bool?
+}
+
+struct SessionPatchResponse: Codable {
+    var ok: Bool
+    var title: String?
+    var model: String?
+    var reasoningEffort: String?
+}
 
 // MARK: - History
 
@@ -228,6 +244,7 @@ struct BridgeEvent: Codable {
     var mode: String?
     var command: String?
     var text: String?
+    var config: SessionConfig?
 
     // hello.ack
     var sessionId: String?
@@ -239,7 +256,7 @@ struct BridgeEvent: Codable {
     enum CodingKeys: String, CodingKey {
         case type, seq, data, message, code, stopReason, toolCallId, tool, label
         case kind, title, status, readOnly, exitCode, locations, usage, commands
-        case entries, mode, command, text
+        case entries, mode, command, text, config
         case sessionId, currentSeq, sessionState, replayed, cwd
         case jobId = "job_id"
     }
@@ -268,4 +285,3 @@ struct Usage: Codable, Hashable {
         return Double(ticks) / 1_000_000_000.0
     }
 }
-

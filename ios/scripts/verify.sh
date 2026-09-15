@@ -16,7 +16,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 SCHEME="GrokRemote"
-SIM="platform=iOS Simulator,name=iPhone 17 Pro"
+SIM="${GROK_REMOTE_SIMULATOR_DESTINATION:-generic/platform=iOS Simulator}"
 # View code, minus the design system itself (which defines the tokens).
 LINT_PATHS=(GrokRemote/Views GrokRemote/Markdown)
 
@@ -53,7 +53,8 @@ lint() {
 build() {
   echo "→ build ($SCHEME)"
   xcodebuild -project GrokRemote.xcodeproj -scheme "$SCHEME" \
-    -destination "$SIM" -derivedDataPath build build \
+    -destination "$SIM" -derivedDataPath build \
+    CODE_SIGNING_ALLOWED=NO build \
     >/tmp/grokremote-build.log 2>&1 \
     || { tail -30 /tmp/grokremote-build.log; fail "xcodebuild"; }
   echo "  BUILD SUCCEEDED"

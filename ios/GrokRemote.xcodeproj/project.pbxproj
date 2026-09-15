@@ -33,7 +33,7 @@
 		179A822528C1851E6E3E68A0 /* ProjectPickerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectPickerView.swift; sourceTree = "<group>"; };
 		191D60523EA0E7555A474434 /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
 		1F58E0007721E5D5121CD8A5 /* QRScannerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QRScannerView.swift; sourceTree = "<group>"; };
-		23C7D2AF27179DA89B5E8A86 /* GrokRemote.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = GrokRemote.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		23C7D2AF27179DA89B5E8A86 /* GrokRemote.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = GrokRemote.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		24381D954AB41A9C37788BDE /* CommandPaletteView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CommandPaletteView.swift; sourceTree = "<group>"; };
 		26194C127900A1E23DB75ECD /* ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatView.swift; sourceTree = "<group>"; };
 		2F06C7367424640BE613D80E /* AppState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppState.swift; sourceTree = "<group>"; };
@@ -145,11 +145,6 @@
 			attributes = {
 				BuildIndependentTargetsInParallel = YES;
 				LastUpgradeCheck = 1430;
-				TargetAttributes = {
-					8268C83EE87BBFB6D3438BF0 = {
-						DevelopmentTeam = "";
-					};
-				};
 			};
 			buildConfigurationList = A5FA637952C851AA26529BA9 /* Build configuration list for PBXProject "GrokRemote" */;
 			developmentRegion = en;

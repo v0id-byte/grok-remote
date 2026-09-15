@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib
 import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -18,6 +19,9 @@ def bridge(monkeypatch):
     monkeypatch.setenv("GROK_BRIDGE_ALLOW_UNSANDBOXED", "1")
     import grok_bridge.config as config
     importlib.reload(config)
+    # The synthetic sessions below live under pytest's temporary directory;
+    # keep them subject to the production allowlist rather than bypassing it.
+    config.ALLOWED_ROOTS.append(Path(tempfile.gettempdir()).resolve())
     import grok_bridge.db as db
     importlib.reload(db)
     import grok_bridge.app as app
@@ -53,6 +57,7 @@ def test_upgrade_is_rejected_without_a_valid_token(client, bridge, tmp_path):
 def test_hello_ack_reports_sequence_and_state(client, bridge, tmp_path):
     bearer = _device(client, bridge.store)
     sid = _session(bridge, tmp_path)
+    bridge.store.update_session(sid, model="grok-4.6", reasoning_effort="high")
     with client.websocket_connect(
         "/v2/chat", headers={"Authorization": f"Bearer {bearer}"}
     ) as ws:
@@ -63,6 +68,11 @@ def test_hello_ack_reports_sequence_and_state(client, bridge, tmp_path):
     assert ack["sessionId"] == sid
     assert ack["currentSeq"] == 0
     assert ack["sessionState"] == "stopped"
+    assert ack["config"] == {
+        "model": "grok-4.6",
+        "reasoningEffort": "high",
+        "reasoningEffortConfigured": True,
+    }
 
 
 def test_events_missed_while_disconnected_are_replayed(client, bridge, tmp_path):

@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import tempfile
+import time
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 
@@ -15,6 +18,7 @@ def bridge(monkeypatch):
     monkeypatch.setenv("GROK_BRIDGE_ALLOW_UNSANDBOXED", "1")
     import grok_bridge.config as config
     importlib.reload(config)
+    config.ALLOWED_ROOTS.append(Path(tempfile.gettempdir()).resolve())
     import grok_bridge.db as db
     importlib.reload(db)
     import grok_bridge.app as app
@@ -54,7 +58,8 @@ def test_models_come_from_files_not_a_screen_scrape(client, auth):
 # --------------------------------------------------------------- workspace
 
 def test_fs_list_flags_repos_and_refuses_paths_outside_the_roots(client, auth, tmp_path):
-    repo = Path.home() / tempfile.mkdtemp(prefix="fs-test-", dir=Path.home())
+    repo = tmp_path / "fs-test"
+    repo.mkdir()
     (repo / "proj").mkdir()
     (repo / "proj" / ".git").mkdir()
     try:
@@ -171,6 +176,185 @@ def test_messages_endpoint_404s_on_an_unknown_session(client, auth):
     assert client.get("/v1/sessions/nope/messages", headers=auth).status_code == 404
 
 
+def _write_disk_session(root: Path, cwd: Path, grok_id: str,
+                        *, title: str = "Imported title", model: str = "grok-4.6",
+                        history: str = "") -> Path:
+    directory = root / quote(str(cwd), safe="") / grok_id
+    directory.mkdir(parents=True)
+    (directory / "summary.json").write_text(json.dumps({
+        "session_summary": title,
+        "current_model_id": model,
+        "head_branch": "main",
+        "num_chat_messages": 2,
+        "last_turn_summary": "last answer",
+    }))
+    if history:
+        (directory / "chat_history.jsonl").write_text(history)
+    return directory
+
+
+def test_sessions_auto_import_grok_history_and_dedupe(client, auth, bridge,
+                                                       tmp_path, monkeypatch):
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    disk_root = tmp_path / "grok-sessions"
+    _write_disk_session(
+        disk_root, cwd, "grok-existing-1",
+        history=json.dumps({"type": "user", "content": "from Mac"}) + "\n" +
+        json.dumps({"type": "assistant", "content": "reply"}) + "\n",
+    )
+    monkeypatch.setattr(bridge.grok_disk, "SESSIONS_DIR", disk_root)
+    bridge.config.ALLOWED_ROOTS[:] = [tmp_path]
+
+    first = client.get("/v1/sessions", headers=auth)
+    assert first.status_code == 200
+    sessions = [s for s in first.json()["sessions"] if s["cwd"] == str(cwd)]
+    assert len(sessions) == 1
+    imported = sessions[0]
+    assert imported["title"] == "Imported title"
+    assert imported["model"] == "grok-4.6"
+    assert imported["headBranch"] == "main"
+    assert imported["canRun"] is True
+
+    second = client.get("/v1/sessions", headers=auth).json()["sessions"]
+    assert len([s for s in second if s["cwd"] == str(cwd)]) == 1
+
+    history = client.get(f"/v1/sessions/{imported['id']}/messages",
+                         headers=auth).json()
+    assert [m["text"] for m in history["messages"]] == ["from Mac", "reply"]
+
+
+def test_discovery_uses_history_file_activity_for_ordering(tmp_path, monkeypatch):
+    from grok_bridge import grok_disk
+
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    disk_root = tmp_path / "grok-sessions"
+    directory = _write_disk_session(
+        disk_root, cwd, "grok-activity-1",
+        history=json.dumps({"type": "user", "content": "hello"}) + "\n",
+    )
+    active_at = time.time() - 10
+    os.utime(directory, (active_at - 5, active_at - 5))
+    os.utime(directory / "summary.json", (active_at - 4, active_at - 4))
+    os.utime(directory / "chat_history.jsonl", (active_at, active_at))
+    monkeypatch.setattr(grok_disk, "SESSIONS_DIR", disk_root)
+
+    found = grok_disk.discover_sessions()
+    assert found[0]["lastActiveAt"] == pytest.approx(active_at)
+
+
+def test_discovery_ignores_malformed_session_metadata(client, auth, bridge,
+                                                       tmp_path, monkeypatch):
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    malformed = tmp_path / "grok-sessions" / quote(str(cwd), safe="") / "bad"
+    malformed.mkdir(parents=True)
+    (malformed / "summary.json").write_text("[]")
+    monkeypatch.setattr(bridge.grok_disk, "SESSIONS_DIR", tmp_path / "grok-sessions")
+    bridge.config.ALLOWED_ROOTS[:] = [tmp_path]
+
+    response = client.get("/v1/sessions", headers=auth)
+    assert response.status_code == 200
+    assert all(session["cwd"] != str(cwd)
+               for session in response.json()["sessions"])
+
+
+def test_imported_session_with_missing_cwd_is_read_only(client, auth, bridge,
+                                                         tmp_path, monkeypatch):
+    missing = tmp_path / "deleted-project"
+    disk_root = tmp_path / "grok-sessions"
+    _write_disk_session(
+        disk_root, missing, "grok-missing-1",
+        history=json.dumps({"type": "user", "content": "old prompt"}) + "\n",
+    )
+    monkeypatch.setattr(bridge.grok_disk, "SESSIONS_DIR", disk_root)
+
+    sessions = client.get("/v1/sessions", headers=auth).json()["sessions"]
+    imported = next(s for s in sessions if s["cwd"] == str(missing))
+    assert imported["cwdExists"] is False
+    assert imported["canRun"] is False
+    assert "read-only" in imported["readOnlyReason"]
+
+    history = client.get(f"/v1/sessions/{imported['id']}/messages",
+                         headers=auth)
+    assert history.status_code == 200
+    assert history.json()["messages"][0]["text"] == "old prompt"
+    assert client.post(f"/v1/sessions/{imported['id']}/command",
+                       json={"name": "cwd"}, headers=auth).status_code == 403
+
+    import starlette.websockets as sw
+    with pytest.raises(sw.WebSocketDisconnect) as error:
+        with client.websocket_connect(
+            "/v2/chat", headers=auth
+        ) as ws:
+            ws.send_json({"type": "hello", "sessionId": imported["id"]})
+            ws.receive_json()
+    assert error.value.code == 4403
+
+
+def test_clearing_imported_session_starts_a_bridge_owned_conversation(
+        client, auth, bridge, tmp_path):
+    sid = bridge.store.upsert_discovered_session(
+        cwd=str(tmp_path), grok_session_id="grok-imported")
+    response = client.post(
+        f"/v1/sessions/{sid}/command", json={"name": "clear"}, headers=auth)
+    assert response.status_code == 200
+    row = bridge.store.get_session(sid)
+    assert row["source"] == "bridge"
+    assert row["grok_session_id"] != "grok-imported"
+
+
+def test_configuration_change_is_rejected_during_a_live_turn(client, auth, bridge,
+                                                               tmp_path):
+    from grok_bridge.acp import SessionState
+
+    sid = bridge.store.create_session(str(tmp_path), "t")
+
+    class LiveProcess:
+        alive = True
+        state = SessionState.RUNNING
+        model = "grok-4.6"
+        reasoning_effort = "high"
+        models = {"currentModelId": "grok-4.6", "availableModels": []}
+
+    bridge.agents._procs[sid] = LiveProcess()
+    response = client.patch(
+        f"/v1/sessions/{sid}",
+        json={"reasoningEffort": "low"},
+        headers=auth,
+    )
+    assert response.status_code == 409
+    assert bridge.store.get_session(sid)["reasoning_effort"] is None
+
+    command = client.post(
+        f"/v1/sessions/{sid}/command",
+        json={"name": "effort", "args": "low"},
+        headers=auth,
+    )
+    assert command.status_code == 400
+    assert bridge.store.get_session(sid)["reasoning_effort"] is None
+
+
+def test_legacy_chat_rejects_invalid_model_effort_pair(client, auth, bridge, tmp_path):
+    sid = bridge.store.create_session(str(tmp_path), "t")
+    token = auth["Authorization"].removeprefix("Bearer ")
+    import starlette.websockets as sw
+
+    with pytest.raises(sw.WebSocketDisconnect) as error:
+        with client.websocket_connect("/v1/chat") as ws:
+            ws.send_json({
+                "token": token,
+                "sessionId": sid,
+                "text": "hello",
+                "model": "grok-4.5",
+                "reasoningEffort": "xhigh",
+            })
+            assert ws.receive_json()["code"] == "invalid_config"
+            ws.receive_json()
+    assert error.value.code == 4400
+
+
 # ---------------------------------------------------------------- commands
 
 def test_command_palette_labels_where_each_command_comes_from(client, auth, bridge,
@@ -232,3 +416,82 @@ def test_patch_and_delete_a_session(client, auth, bridge, tmp_path):
     assert client.delete(f"/v1/sessions/{sid}", headers=auth).json()["deleted"] is True
     assert bridge.store.get_session(sid) is None
     assert bridge.store.latest_seq(sid) == 0
+
+
+def test_session_config_switch_validates_and_clears_incompatible_effort(
+        client, auth, bridge, tmp_path):
+    sid = bridge.store.create_session(str(tmp_path), "t")
+    response = client.patch(
+        f"/v1/sessions/{sid}",
+        json={"model": "grok-4.6", "reasoningEffort": "xhigh"},
+        headers=auth,
+    )
+    assert response.status_code == 200
+    assert response.json()["model"] == "grok-4.6"
+    assert response.json()["reasoningEffort"] == "xhigh"
+
+    rejected = client.patch(
+        f"/v1/sessions/{sid}",
+        json={"model": "grok-4.5", "reasoningEffort": "xhigh"},
+        headers=auth,
+    )
+    assert rejected.status_code == 400
+    row = bridge.store.get_session(sid)
+    assert row["model"] == "grok-4.6" and row["reasoning_effort"] == "xhigh"
+
+    switched = client.patch(
+        f"/v1/sessions/{sid}", json={"model": "grok-4.5"}, headers=auth)
+    assert switched.status_code == 200
+    assert switched.json()["reasoningEffort"] is None
+    row = bridge.store.get_session(sid)
+    assert row["model"] == "grok-4.5" and row["reasoning_effort"] is None
+
+    assert client.patch(
+        f"/v1/sessions/{sid}", json={"reasoningEffort": "high"},
+        headers=auth).status_code == 200
+    cleared = client.patch(
+        f"/v1/sessions/{sid}", json={"reasoningEffort": ""}, headers=auth)
+    assert cleared.status_code == 200
+    assert cleared.json()["reasoningEffort"] is None
+    assert bridge.store.get_session(sid)["reasoning_effort"] is None
+
+
+def test_model_command_uses_the_same_effort_safety_rules(client, auth, bridge, tmp_path):
+    sid = bridge.store.create_session(str(tmp_path), "t")
+    assert client.post(
+        f"/v1/sessions/{sid}/command", json={"name": "model", "args": "grok-4.6"},
+        headers=auth).status_code == 200
+    assert client.post(
+        f"/v1/sessions/{sid}/command", json={"name": "effort", "args": "xhigh"},
+        headers=auth).status_code == 200
+    assert client.post(
+        f"/v1/sessions/{sid}/command", json={"name": "model", "args": "grok-4.5"},
+        headers=auth).status_code == 200
+
+    row = bridge.store.get_session(sid)
+    assert row["model"] == "grok-4.5"
+    assert row["reasoning_effort"] is None
+
+
+@pytest.mark.asyncio
+async def test_successful_prompt_persists_the_effective_config(bridge, tmp_path,
+                                                                monkeypatch):
+    sid = bridge.store.upsert_discovered_session(
+        cwd=str(tmp_path), grok_session_id="grok-imported")
+    seen: dict[str, object] = {}
+
+    async def prompt(**kwargs):
+        seen.update(kwargs)
+        return {"stopReason": "end_turn", "usage": None}
+
+    monkeypatch.setattr(bridge.agents, "prompt", prompt)
+    await bridge._v2_turn(
+        sid,
+        bridge.store.get_session(sid),
+        {"text": "hello", "model": "grok-4.6", "reasoningEffort": "high"},
+    )
+
+    row = bridge.store.get_session(sid)
+    assert row["model"] == "grok-4.6"
+    assert row["reasoning_effort"] == "high"
+    assert seen["resume"] is True

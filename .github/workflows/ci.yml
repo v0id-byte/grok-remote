@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  bridge:
+    runs-on: macos-14
+    defaults:
+      run:
+        working-directory: bridge
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: latest
+      - run: uv sync --locked
+      - run: uv run pytest -q
+      - run: uv build
+
+  installer:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash -n install.sh
+      - run: ./install.sh install --quick-tunnel --dry-run --source-dir "$PWD"
+
+  ios:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - run: ios/scripts/verify.sh lint
+      - run: ios/scripts/verify.sh build

@@ -38,7 +38,7 @@ from fastapi.responses import JSONResponse
 
 from . import commands as cmd_registry
 from . import config, grok_disk, workspace
-from .acp import AgentBusy, AgentUnavailable
+from .acp import AgentBusy, AgentUnavailable, SessionState
 from .db import Store
 from .sandbox import SandboxNotEnforced
 from .security import InvalidCwd, validate_cwd
@@ -118,6 +118,154 @@ def _check_bearer(authorization: str | None, request: Request | None = None) -> 
 
 def _device_id_of(authorization: str | None) -> str:
     return (authorization or "").removeprefix("Bearer ").strip().partition(".")[0]
+
+
+def _runtime_access(cwd: str, source: str = "bridge") -> tuple[bool, str | None]:
+    """Return whether a session may start an agent in its current cwd."""
+    try:
+        validate_cwd(cwd)
+    except InvalidCwd as error:
+        if not Path(cwd).is_dir():
+            return False, "The working directory is missing. History is read-only."
+        return False, f"The working directory is read-only: {error}"
+    return True, None
+
+
+def _sync_discovered_sessions() -> None:
+    for item in grok_disk.discover_sessions():
+        summary = item["summary"]
+        store.upsert_discovered_session(
+            cwd=item["cwd"],
+            grok_session_id=item["grokSessionId"],
+            title=summary.get("title"),
+            model=summary.get("model"),
+            created_at=item.get("createdAt"),
+            last_active_at=item.get("lastActiveAt"),
+        )
+
+
+def _session_source(session) -> str:
+    return session["source"] if "source" in session.keys() else "bridge"
+
+
+def _session_model(session, proc=None) -> str | None:
+    if proc is not None and proc.alive:
+        live_model = proc.model or proc.models.get("currentModelId")
+        if live_model:
+            return live_model
+    model = session["model"] if "model" in session.keys() else None
+    if model:
+        return model
+    return grok_disk.read_summary(
+        session["cwd"], session["grok_session_id"]).get("model")
+
+
+def _known_model_ids(proc=None) -> set[str]:
+    available = (proc.models if proc is not None else {}).get("availableModels") or []
+    ids = {item.get("modelId") for item in available if item.get("modelId")}
+    if ids:
+        return ids
+    return set(grok_disk.read_models()["models"])
+
+
+def _validate_model_choice(model_id: str, proc=None) -> None:
+    known = _known_model_ids(proc)
+    if known and model_id not in known:
+        raise HTTPException(400, f"unknown or unavailable model: {model_id}")
+
+
+def _effort_info(model_id: str | None, proc=None) -> tuple[bool | None, list[str]]:
+    """Return (supported, choices) for a model when metadata is available.
+
+    A live ACP session is authoritative for the models it advertises. The
+    on-disk catalogue fills the gap before an agent has been started. `None`
+    means neither source knows enough to reject a value, which keeps a newly
+    configured local model usable instead of guessing.
+    """
+    if not model_id:
+        return None, []
+
+    available = (proc.models if proc is not None else {}).get("availableModels") or []
+    for entry in available:
+        if entry.get("modelId") != model_id:
+            continue
+        meta = entry.get("_meta") or {}
+        raw_efforts = (meta.get("reasoningEfforts")
+                       or meta.get("reasoning_efforts")
+                       or entry.get("reasoningEfforts")
+                       or entry.get("reasoning_efforts")
+                       or [])
+        efforts = []
+        for item in raw_efforts:
+            value = (item.get("id") or item.get("value")) \
+                if isinstance(item, dict) else str(item)
+            if value:
+                efforts.append(str(value))
+        supports = meta.get("supportsReasoningEffort")
+        if supports is None:
+            supports = entry.get("supportsReasoningEffort")
+        if supports is not None or efforts:
+            return bool(supports) or bool(efforts), efforts
+        break
+
+    info = grok_disk.read_models()["models"].get(model_id)
+    if info is None:
+        return None, []
+    efforts = info.get("reasoningEfforts") or []
+    supports = info.get("supportsReasoningEffort")
+    if supports is None:
+        supports = bool(efforts)
+    return bool(supports) or bool(efforts), efforts
+
+
+def _validate_effort_choice(effort: str, model_id: str | None, proc=None) -> None:
+    if not model_id:
+        return
+    supported, efforts = _effort_info(model_id, proc)
+    if supported is False:
+        raise HTTPException(400, f"reasoning effort is not supported by {model_id}")
+    if efforts and effort not in efforts:
+        raise HTTPException(400, f"reasoning effort is not supported by {model_id}: {effort}")
+
+
+def _validate_prompt_config(session, frame: dict[str, Any], proc=None) -> None:
+    model = frame.get("model")
+    if model:
+        _validate_model_choice(model, proc if proc and proc.alive else None)
+    selected_model = model or _session_model(session, proc)
+    effort = frame.get("reasoningEffort")
+    if effort:
+        _validate_effort_choice(
+            effort, selected_model, proc if proc and proc.alive else None)
+    elif model and session["reasoning_effort"]:
+        _validate_effort_choice(
+            session["reasoning_effort"], selected_model,
+            proc if proc and proc.alive else None)
+
+
+def _persist_prompt_config(session_id: str, session, frame: dict[str, Any]) -> None:
+    """Remember the settings actually used for a successful prompt."""
+    fields: dict[str, Any] = {}
+    if frame.get("model"):
+        fields["model"] = frame["model"]
+    if "reasoningEffort" in frame:
+        fields["reasoning_effort"] = frame.get("reasoningEffort") or None
+    if not fields:
+        return
+
+    store.update_session(session_id, **fields)
+    updated = store.get_session(session_id)
+    if updated is None:
+        return
+    proc = agents._procs.get(session_id)
+    agents.emit(session_id, {
+        "type": "config.changed",
+        "config": {
+            "model": _session_model(updated, proc),
+            "reasoningEffort": updated["reasoning_effort"],
+            "reasoningEffortConfigured": updated["reasoning_effort"] is not None,
+        },
+    })
 
 
 @app.get("/health")
@@ -207,8 +355,10 @@ def list_sessions(request: Request, authorization: str | None = Header(None)) ->
     that has not run a turn yet has no summary file.
     """
     _check_bearer(authorization, request)
+    _sync_discovered_sessions()
     out = []
     for row in store.list_sessions():
+        can_run, read_only_reason = _runtime_access(row["cwd"], _session_source(row))
         session = {
             "id": row["id"],
             "cwd": row["cwd"],
@@ -222,11 +372,15 @@ def list_sessions(request: Request, authorization: str | None = Header(None)) ->
             # Sessions outlive their directories -- a deleted checkout should be
             # visibly broken in the list rather than failing on first use.
             "cwdExists": Path(row["cwd"]).is_dir(),
+            "canRun": can_run,
+            "readOnlyReason": read_only_reason,
         }
         summary = grok_disk.read_summary(row["cwd"], row["grok_session_id"])
         if summary:
             session["title"] = session["title"] or summary.get("title")
             session["model"] = session["model"] or summary.get("model")
+            if not row["model"] and summary.get("model"):
+                store.update_session(row["id"], model=summary["model"])
             session["messageCount"] = summary.get("messageCount")
             session["headBranch"] = summary.get("headBranch")
             session["lastTurnSummary"] = summary.get("lastTurnSummary")
@@ -300,6 +454,17 @@ async def chat(ws: WebSocket) -> None:
     if session is None:
         await ws.close(code=4404)
         return
+    can_run, _ = _runtime_access(session["cwd"], _session_source(session))
+    if not can_run:
+        await ws.close(code=4403)
+        return
+    try:
+        _validate_prompt_config(session, first, agents._procs.get(session_id))
+    except HTTPException as e:
+        await ws.send_json({"type": "message.error", "code": "invalid_config",
+                            "message": str(e.detail)})
+        await ws.close(code=4400)
+        return
 
     job_id = store.create_job(session_id)
     store.add_message_preview(session_id, "user", first.get("text", ""))
@@ -315,6 +480,7 @@ async def chat(ws: WebSocket) -> None:
         blocks=blocks,
         model=first.get("model"),
         reasoning_effort=first.get("reasoningEffort"),
+        resume=True if _session_source(session) == "discovered" else None,
     ))
 
     async def _watch_for_cancel() -> None:
@@ -356,6 +522,7 @@ async def chat(ws: WebSocket) -> None:
             await _forward(queue.get_nowait())
 
         result = await turn
+        _persist_prompt_config(session_id, session, first)
         stop_reason = result.get("stopReason")
         if stop_reason == "cancelled":
             final_status = "cancelled"
@@ -508,6 +675,10 @@ async def chat_v2(ws: WebSocket) -> None:
     if session is None:
         await ws.close(code=4404)
         return
+    can_run, _ = _runtime_access(session["cwd"], _session_source(session))
+    if not can_run:
+        await ws.close(code=4403)
+        return
 
     queue = agents.attach(session_id)
     send_lock = asyncio.Lock()
@@ -534,6 +705,12 @@ async def chat_v2(ws: WebSocket) -> None:
         else:
             after_seq = int(raw_after)
             missed = store.events_after(session_id, after_seq)
+        live_proc = agents._procs.get(session_id)
+        effective_effort = (
+            live_proc.reasoning_effort
+            if live_proc is not None and live_proc.alive
+            else session["reasoning_effort"]
+        )
         await send({
             "type": "hello.ack",
             "sessionId": session_id,
@@ -541,6 +718,11 @@ async def chat_v2(ws: WebSocket) -> None:
             "sessionState": agents.state_of(session_id),
             "replayed": len(missed),
             "cwd": session["cwd"],
+            "config": {
+                "model": _session_model(session, live_proc),
+                "reasoningEffort": effective_effort,
+                "reasoningEffortConfigured": effective_effort is not None,
+            },
         })
         for event in missed:
             await send(event)
@@ -614,6 +796,18 @@ async def _v2_turn(session_id: str, session, frame: dict[str, Any]) -> None:
     manager so it is numbered and persisted, which is what lets a client that
     disconnects mid-turn replay it.
     """
+    # The socket keeps the row from hello, but another device may have changed
+    # model/effort since then. Read the current row before validating or
+    # starting a turn so the prompt cannot revive stale configuration.
+    session = store.get_session(session_id) or session
+    try:
+        _validate_prompt_config(session, frame, agents._procs.get(session_id))
+    except HTTPException as e:
+        agents.emit(session_id, {
+            "type": "message.error", "code": "invalid_config",
+            "message": str(e.detail)})
+        return
+
     job_id = store.create_job(session_id)
     agents.set_job(session_id, job_id)
     store.add_message_preview(session_id, "user", frame.get("text", ""))
@@ -628,7 +822,9 @@ async def _v2_turn(session_id: str, session, frame: dict[str, Any]) -> None:
             blocks=_prompt_blocks(frame.get("text", ""), frame.get("attachments")),
             model=frame.get("model"),
             reasoning_effort=frame.get("reasoningEffort"),
+            resume=True if _session_source(session) == "discovered" else None,
         )
+        _persist_prompt_config(session_id, session, frame)
         stop_reason = result.get("stopReason")
         if stop_reason == "cancelled":
             status = "cancelled"
@@ -731,25 +927,97 @@ async def patch_session(session_id: str, body: dict[str, Any], request: Request,
     if session is None:
         raise HTTPException(404, "unknown session")
 
+    has_model = "model" in body and body["model"] not in (None, "")
+    has_effort = "reasoningEffort" in body
+    if has_model and not isinstance(body["model"], str):
+        raise HTTPException(400, "model must be a string")
+    if has_effort and body["reasoningEffort"] not in (None, "") \
+            and not isinstance(body["reasoningEffort"], str):
+        raise HTTPException(400, "reasoningEffort must be a string or null")
+    if has_model or has_effort:
+        can_run, reason = _runtime_access(session["cwd"], _session_source(session))
+        if not can_run:
+            raise HTTPException(403, reason or "session is read-only")
+
     fields: dict[str, Any] = {}
     if "title" in body:
         fields["title"] = body["title"]
-    if "model" in body:
+    if has_model:
         fields["model"] = body["model"]
-    if "reasoningEffort" in body:
-        fields["reasoning_effort"] = body["reasoningEffort"]
+    proc = agents._procs.get(session_id)
+    live_proc = proc if proc is not None and proc.alive else None
+    selected_model = body.get("model") if has_model \
+        else _session_model(session, live_proc)
+    if has_model:
+        _validate_model_choice(body["model"], live_proc)
+
+    target_effort = (body.get("reasoningEffort") or None) if has_effort \
+        else session["reasoning_effort"]
+    effort_was_cleared = False
+    if target_effort:
+        try:
+            _validate_effort_choice(target_effort, selected_model, live_proc)
+        except HTTPException:
+            if has_model and not has_effort:
+                # A model switch should not strand the session with an effort
+                # level the new model cannot accept. Fall back to that model's
+                # default and restart a live agent below if necessary.
+                target_effort = None
+                effort_was_cleared = True
+            else:
+                raise
+
+    if has_effort or effort_was_cleared:
+        fields["reasoning_effort"] = target_effort
+
+    needs_restart = bool(live_proc and (
+        effort_was_cleared
+        or (has_effort and target_effort != live_proc.reasoning_effort)
+        or (has_model and target_effort != live_proc.reasoning_effort
+            and target_effort is not None)
+    ))
+    if live_proc is not None and live_proc.state is SessionState.RUNNING \
+            and (needs_restart or has_model):
+        raise HTTPException(409, "cannot change session configuration while a turn is running")
+    if live_proc is not None and needs_restart:
+        try:
+            await agents.restart(
+                session_id=session_id,
+                grok_session_id=live_proc.grok_session_id,
+                cwd=Path(session["cwd"]),
+                model=selected_model or live_proc.model,
+                reasoning_effort=target_effort,
+            )
+        except AgentBusy as e:
+            raise HTTPException(409, str(e)) from e
+    elif live_proc is not None and has_model:
+        try:
+            if selected_model != _session_model(session, live_proc):
+                await live_proc.set_model(selected_model)
+        except AgentBusy as e:
+            raise HTTPException(409, str(e)) from e
+
     if fields:
         store.update_session(session_id, **fields)
-
-    # Apply to the live agent too, when there is one.
-    if body.get("model"):
-        proc = agents._procs.get(session_id)
-        if proc is not None and proc.alive:
-            try:
-                await proc.set_model(body["model"])
-            except AgentBusy as e:
-                raise HTTPException(409, str(e)) from e
-    return {"ok": True, **{k: v for k, v in fields.items()}}
+    config_changed = has_model or has_effort or effort_was_cleared
+    updated = store.get_session(session_id)
+    if config_changed and updated is not None:
+        agents.emit(session_id, {
+            "type": "config.changed",
+            "config": {
+                "model": _session_model(updated, agents._procs.get(session_id)),
+                "reasoningEffort": updated["reasoning_effort"],
+                "reasoningEffortConfigured": updated["reasoning_effort"] is not None,
+            },
+        })
+    if updated is None:
+        raise HTTPException(404, "unknown session")
+    return {
+        "ok": True,
+        "model": _session_model(updated, agents._procs.get(session_id)),
+        "reasoningEffort": updated["reasoning_effort"],
+        **({"title": updated["title"]} if "title" in body else {}),
+    }
 
 
 @app.delete("/v1/sessions/{session_id}")
@@ -780,8 +1048,8 @@ async def session_commands(session_id: str, request: Request,
     proc = agents._procs.get(session_id)
     acp_commands = proc.available_commands if proc and proc.alive else []
     session_models = proc.models if proc and proc.alive else {}
-    current_model = (session["model"] if "model" in session.keys() else None) \
-        or (session_models.get("currentModelId") if session_models else None)
+    current_model = (session_models.get("currentModelId") if session_models else None) \
+        or _session_model(session, proc if proc and proc.alive else None)
 
     return {
         # ACP-native commands are discovered from a running agent, so an idle
@@ -806,6 +1074,9 @@ async def run_command(session_id: str, body: dict[str, Any], request: Request,
     session = store.get_session(session_id)
     if session is None:
         raise HTTPException(404, "unknown session")
+    can_run, reason = _runtime_access(session["cwd"], _session_source(session))
+    if not can_run:
+        raise HTTPException(403, reason or "session is read-only")
     try:
         return await _execute_command(session_id, session, body.get("name", ""),
                                       body.get("args"))
@@ -815,6 +1086,9 @@ async def run_command(session_id: str, body: dict[str, Any], request: Request,
 
 async def _execute_command(session_id: str, session, name: str,
                            args: str | None) -> dict[str, Any]:
+    can_run, reason = _runtime_access(session["cwd"], _session_source(session))
+    if not can_run:
+        raise cmd_registry.CommandError(reason or "session is read-only")
     name = (name or "").lstrip("/").strip()
     canonical, kind = cmd_registry.resolve(name)
 
@@ -845,29 +1119,98 @@ async def _execute_command(session_id: str, session, name: str,
     if canonical == "model":
         if not args:
             raise cmd_registry.CommandError("/model needs a model id")
-        proc = await agents.get(session_id=session_id,
-                                grok_session_id=session["grok_session_id"],
-                                cwd=Path(session["cwd"]))
+        proc = agents._procs.get(session_id)
+        live_proc = proc if proc is not None and proc.alive else None
         try:
-            await proc.set_model(args)
-        except AgentBusy as e:
-            raise cmd_registry.CommandError(str(e)) from e
-        store.update_session(session_id, model=args)
+            _validate_model_choice(args, live_proc)
+        except HTTPException as e:
+            raise cmd_registry.CommandError(str(e.detail)) from e
+
+        target_effort = session["reasoning_effort"] or None
+        effort_was_cleared = False
+        if target_effort:
+            try:
+                _validate_effort_choice(target_effort, args, live_proc)
+            except HTTPException:
+                target_effort = None
+                effort_was_cleared = True
+
+        if live_proc is not None and live_proc.state is SessionState.RUNNING:
+            raise cmd_registry.CommandError(
+                "cannot change model while a turn is running")
+        if live_proc is not None and (
+                effort_was_cleared or target_effort != live_proc.reasoning_effort):
+            try:
+                await agents.restart(
+                    session_id=session_id,
+                    grok_session_id=live_proc.grok_session_id,
+                    cwd=Path(session["cwd"]),
+                    model=args,
+                    reasoning_effort=target_effort,
+                )
+            except AgentBusy as e:
+                raise cmd_registry.CommandError(str(e)) from e
+        elif live_proc is not None and args != _session_model(session, live_proc):
+            try:
+                await live_proc.set_model(args)
+            except AgentBusy as e:
+                raise cmd_registry.CommandError(str(e)) from e
+
+        fields = {"model": args}
+        if effort_was_cleared:
+            fields["reasoning_effort"] = None
+        store.update_session(session_id, **fields)
+        updated = store.get_session(session_id)
+        if updated is not None:
+            agents.emit(session_id, {
+                "type": "config.changed",
+                "config": {
+                    "model": _session_model(updated, agents._procs.get(session_id)),
+                    "reasoningEffort": updated["reasoning_effort"],
+                    "reasoningEffortConfigured": updated["reasoning_effort"] is not None,
+                },
+            })
         return {"command": "model", "kind": "bridge", "text": args}
 
     if canonical == "effort":
         if not args:
             raise cmd_registry.CommandError("/effort needs a level")
+        proc = agents._procs.get(session_id)
+        try:
+            _validate_effort_choice(
+                args, _session_model(session, proc), proc if proc and proc.alive else None)
+        except HTTPException as e:
+            raise cmd_registry.CommandError(str(e.detail)) from e
         # No ACP channel exists for reasoning effort -- it is a spawn-time flag.
         # Restarting reloads the session, and context survives that.
+        restarted = False
+        if proc is not None and proc.alive:
+            if proc.state is SessionState.RUNNING:
+                raise cmd_registry.CommandError(
+                    "cannot change reasoning effort while a turn is running")
+            try:
+                await agents.restart(session_id=session_id,
+                                     grok_session_id=session["grok_session_id"],
+                                     cwd=Path(session["cwd"]),
+                                     model=_session_model(session, proc) or proc.model,
+                                     reasoning_effort=args)
+            except AgentBusy as e:
+                raise cmd_registry.CommandError(str(e)) from e
+            restarted = True
         store.update_session(session_id, reasoning_effort=args)
-        await agents.restart(session_id=session_id,
-                             grok_session_id=session["grok_session_id"],
-                             cwd=Path(session["cwd"]),
-                             model=session["model"] if "model" in session.keys() else None,
-                             reasoning_effort=args)
+        updated = store.get_session(session_id)
+        agents.emit(session_id, {
+            "type": "config.changed",
+            "config": {
+                "model": _session_model(updated, agents._procs.get(session_id))
+                if updated is not None else None,
+                "reasoningEffort": args,
+                "reasoningEffortConfigured": True,
+            },
+        })
         return {"command": "effort", "kind": "bridge", "text": args,
-                "note": "agent restarted; conversation context preserved"}
+                "note": ("agent restarted; conversation context preserved"
+                         if restarted else "will apply when the agent starts")}
 
     if canonical == "clear":
         # A new grok-side conversation in the same directory, keeping the
@@ -875,7 +1218,10 @@ async def _execute_command(session_id: str, session, name: str,
         import uuid as _uuid
         await agents.retire(session_id)
         new_grok_id = str(_uuid.uuid4())
-        store.update_session(session_id, grok_session_id=new_grok_id)
+        # The new conversation has no imported Grok transcript to load. Mark
+        # it as Bridge-owned so the next prompt uses session/new rather than
+        # trying session/load with the freshly minted id.
+        store.update_session(session_id, grok_session_id=new_grok_id, source="bridge")
         agents.forget(session_id)
         agents.emit(session_id, {"type": "session.cleared"})
         return {"command": "clear", "kind": "bridge", "text": "started a new conversation"}
@@ -886,6 +1232,10 @@ async def _execute_command(session_id: str, session, name: str,
 async def _v2_command(session_id: str, session, name: str, args: str | None) -> None:
     """Run a non-streaming command and publish its result on the event stream."""
     try:
+        # A second device may have changed the session since this socket's
+        # hello. Commands that inspect or mutate model/effort must use the
+        # current row, not the hello snapshot.
+        session = store.get_session(session_id) or session
         result = await _execute_command(session_id, session, name, args)
         agents.emit(session_id, {"type": "command.result", **result})
     except cmd_registry.CommandError as e:

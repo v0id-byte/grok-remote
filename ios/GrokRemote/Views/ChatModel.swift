@@ -46,11 +46,18 @@ final class ChatModel {
     private(set) var acpAvailable = false
     private(set) var usage: Usage?
     private(set) var currentModel: String?
+    private(set) var currentEffort: String?
+    private(set) var modelOptions: [ModelInfo] = []
+    private(set) var isUpdatingConfig = false
     private(set) var isStreaming = false
     private(set) var isConnected = false
     private(set) var hasMoreHistory = false
     var banner: String?
     var errorBanner: String?
+
+    var canRun: Bool { session?.canRun != false }
+    var readOnlyReason: String? { session?.readOnlyReason }
+    var workingDirectory: String { session?.cwd ?? "" }
 
     private var client: BridgeClient?
     private var session: ChatSession?
@@ -59,6 +66,8 @@ final class ChatModel {
     private var lastSeq = 0
     private var nextHistoryBefore: Int?
     private var contextWindow: Int?
+    private var configuredDefaultModel: String?
+    private var configuredDefaultEffort: String?
 
     /// Streaming deltas arrive per token. Re-rendering Markdown on every one of
     /// them visibly stutters on long answers, so text accumulates here and is
@@ -67,11 +76,18 @@ final class ChatModel {
     private var flushTask: Task<Void, Never>?
     private let flushInterval = Duration.milliseconds(50)
 
-    func start(client: BridgeClient, session: ChatSession) async {
+    func start(client: BridgeClient, session: ChatSession,
+               defaultModel: String? = nil, defaultEffort: String? = nil) async {
         self.client = client
         self.session = session
+        configuredDefaultModel = defaultModel
+        configuredDefaultEffort = defaultEffort
         await loadHistory()
         await loadCommands()
+        guard canRun else {
+            banner = readOnlyReason ?? "This session is read-only."
+            return
+        }
         connect()
     }
 
@@ -119,12 +135,77 @@ final class ChatModel {
 
     private func loadCommands() async {
         guard let client, let session else { return }
-        guard let response = try? await client.commands(session.id) else { return }
-        commands = response.commands
-        acpAvailable = response.acpAvailable
+        if let response = try? await client.commands(session.id) {
+            commands = response.commands
+            acpAvailable = response.acpAvailable
+        }
         if let models = try? await client.models() {
-            currentModel = currentModel ?? session.model ?? models.defaultModel
+            modelOptions = models.models
+            currentModel = currentModel ?? session.model ?? configuredDefaultModel ?? models.defaultModel
+            currentEffort = validEffort(
+                currentEffort ?? session.reasoningEffort ?? configuredDefaultEffort,
+                for: currentModel, in: models.models)
             contextWindow = models.models.first { $0.id == currentModel }?.contextWindow
+        }
+    }
+
+    private func validEffort(_ value: String?, for model: String?,
+                             in options: [ModelInfo]) -> String? {
+        guard let value else { return nil }
+        guard let option = options.first(where: { $0.id == model }) else { return value }
+        if !option.reasoningEfforts.isEmpty {
+            return option.reasoningEfforts.contains(value) ? value : nil
+        }
+        return option.supportsReasoningEffort ? value : nil
+    }
+
+    // MARK: Session configuration
+
+    @discardableResult
+    func updateModel(_ value: String) async -> Bool {
+        guard let client, let session, canRun else { return false }
+        isUpdatingConfig = true
+        errorBanner = nil
+        defer { isUpdatingConfig = false }
+        do {
+            let response = try await client.patchSession(
+                session.id, fields: ["model": value])
+            currentModel = response.model ?? value
+            currentEffort = response.reasoningEffort
+            configuredDefaultEffort = nil
+            var updated = session
+            updated.model = currentModel
+            updated.reasoningEffort = currentEffort
+            self.session = updated
+            contextWindow = modelOptions.first { $0.id == currentModel }?.contextWindow
+            await loadCommands()
+            return true
+        } catch {
+            errorBanner = error.localizedDescription
+            return false
+        }
+    }
+
+    @discardableResult
+    func updateEffort(_ value: String?) async -> Bool {
+        guard let client, let session, canRun else { return false }
+        isUpdatingConfig = true
+        errorBanner = nil
+        defer { isUpdatingConfig = false }
+        do {
+            var fields: [String: Any] = [:]
+            fields["reasoningEffort"] = value ?? NSNull()
+            let response = try await client.patchSession(session.id, fields: fields)
+            currentEffort = response.reasoningEffort
+            configuredDefaultEffort = nil
+            var updated = session
+            updated.reasoningEffort = currentEffort
+            self.session = updated
+            await loadCommands()
+            return true
+        } catch {
+            errorBanner = error.localizedDescription
+            return false
         }
     }
 
@@ -176,6 +257,27 @@ final class ChatModel {
             isConnected = true
             banner = nil
             if let seq = event.currentSeq { lastSeq = max(lastSeq, seq) }
+            if let config = event.config {
+                var updated = session
+                if let value = config.model {
+                    currentModel = value
+                    updated?.model = value
+                }
+                if config.reasoningEffortConfigured == true {
+                    currentEffort = config.reasoningEffort
+                    configuredDefaultEffort = nil
+                    updated?.reasoningEffort = currentEffort
+                } else if config.reasoningEffortConfigured == false,
+                          session?.reasoningEffort != nil {
+                    // The list response may have been stale when another
+                    // device cleared the session's effort.
+                    currentEffort = nil
+                    configuredDefaultEffort = nil
+                    updated?.reasoningEffort = nil
+                }
+                self.session = updated
+                contextWindow = modelOptions.first { $0.id == currentModel }?.contextWindow
+            }
             isStreaming = (event.sessionState == "running")
             if isStreaming { ensureAssistant() }
 
@@ -261,6 +363,9 @@ final class ChatModel {
                 currentModel = value
                 Task { await loadCommands() }
             }
+            if event.command == "effort" {
+                currentEffort = event.text
+            }
             let text = event.text ?? "Done."
             messages.append(ChatMessage(id: UUID().uuidString, role: "system",
                                         text: "/\(event.command ?? "") — \(text)"))
@@ -269,6 +374,24 @@ final class ChatModel {
             errorBanner = event.message
 
         case "config.changed":
+            if let config = event.config {
+                var updated = session
+                if let value = config.model {
+                    currentModel = value
+                    updated?.model = value
+                }
+                if config.reasoningEffortConfigured == false {
+                    currentEffort = nil
+                    configuredDefaultEffort = nil
+                    updated?.reasoningEffort = nil
+                } else if let value = config.reasoningEffort {
+                    currentEffort = value
+                    configuredDefaultEffort = nil
+                    updated?.reasoningEffort = value
+                }
+                self.session = updated
+                contextWindow = modelOptions.first { $0.id == currentModel }?.contextWindow
+            }
             Task { await loadCommands() }
 
         case "agent.restarting":
@@ -316,6 +439,7 @@ final class ChatModel {
     // MARK: Sending
 
     func send(text: String, model: String?, effort: String?, attachments: [String]) async {
+        guard canRun else { return }
         errorBanner = nil
         banner = nil
         messages.append(ChatMessage(id: UUID().uuidString, role: "user", text: text))
@@ -330,6 +454,7 @@ final class ChatModel {
     }
 
     func run(command: CommandSpec, argument: String?) async {
+        guard canRun, socket != nil else { return }
         errorBanner = nil
         do {
             try await socket?.command(name: command.name, args: argument)

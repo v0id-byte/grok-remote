@@ -1,7 +1,8 @@
 [project]
 name = "grok-remote-bridge"
 version = "0.1.0"
-description = "Add your description here"
+description = "A local Bridge for remotely driving the Grok CLI from iOS"
+readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "fastapi>=0.141.1",
@@ -9,6 +10,16 @@ dependencies = [
     "uvicorn[standard]>=0.52.3",
     "websockets>=17.0.1",
 ]
+
+[project.scripts]
+grok-remote-bridge = "grok_bridge.cli:main"
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["grok_bridge"]
 
 [dependency-groups]
 dev = [

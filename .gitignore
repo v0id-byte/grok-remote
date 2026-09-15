@@ -1,5 +1,8 @@
 # --- python / bridge runtime ---
 bridge/.venv/
+bridge/dist/
+bridge/build/
+bridge/*.egg-info/
 bridge/__pycache__/
 bridge/**/__pycache__/
 *.pyc

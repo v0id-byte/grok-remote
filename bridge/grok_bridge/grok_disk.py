@@ -54,20 +54,83 @@ def session_dir(cwd: str | Path, grok_session_id: str) -> Path | None:
     "no history" for a path that quotes differently.
     """
     direct = SESSIONS_DIR / encode_cwd(cwd) / grok_session_id
-    if direct.is_dir():
+    if direct.is_dir() and not direct.is_symlink():
         return direct
 
     target = str(Path(cwd))
     if not SESSIONS_DIR.is_dir():
         return None
-    for entry in SESSIONS_DIR.iterdir():
-        if not entry.is_dir():
+    try:
+        entries = list(SESSIONS_DIR.iterdir())
+    except OSError:
+        return None
+    for entry in entries:
+        if entry.is_symlink() or not entry.is_dir():
             continue
         if unquote(entry.name) == target:
             candidate = entry / grok_session_id
-            if candidate.is_dir():
+            if candidate.is_dir() and not candidate.is_symlink():
                 return candidate
     return None
+
+
+def discover_sessions() -> list[dict[str, Any]]:
+    """Find Grok sessions that were not created through this Bridge.
+
+    The directory layout is Grok's private storage format, so discovery stays
+    in this adapter rather than leaking it into the HTTP layer.  A malformed
+    or half-written session is skipped independently; one bad entry must not
+    make the phone lose every other session.
+    """
+    if not SESSIONS_DIR.is_dir():
+        return []
+
+    discovered: list[dict[str, Any]] = []
+    try:
+        cwd_entries = list(SESSIONS_DIR.iterdir())
+    except OSError:
+        return []
+
+    for cwd_entry in cwd_entries:
+        if not cwd_entry.is_dir() or cwd_entry.is_symlink():
+            continue
+        cwd = unquote(cwd_entry.name)
+        if not Path(cwd).is_absolute():
+            # A session path that cannot be represented as an absolute cwd is
+            # not safe to expose as runnable workspace state.
+            continue
+        try:
+            session_entries = list(cwd_entry.iterdir())
+        except OSError:
+            continue
+        for session_entry in session_entries:
+            if not session_entry.is_dir() or session_entry.is_symlink():
+                continue
+            try:
+                summary = read_summary(cwd, session_entry.name)
+                stat = session_entry.stat()
+                history_path = session_entry / "chat_history.jsonl"
+                summary_path = session_entry / "summary.json"
+                has_history = history_path.is_file() and not history_path.is_symlink()
+                if not summary and not has_history:
+                    continue
+                mtimes = [stat.st_mtime]
+                for path in (summary_path, history_path):
+                    if path.is_file() and not path.is_symlink():
+                        mtimes.append(path.stat().st_mtime)
+            except OSError:
+                continue
+
+            birth = getattr(stat, "st_birthtime", stat.st_mtime)
+            discovered.append({
+                "cwd": cwd,
+                "grokSessionId": session_entry.name,
+                "summary": summary,
+                "createdAt": birth,
+                "lastActiveAt": max(mtimes),
+            })
+
+    return discovered
 
 
 # grok wraps the actual thing a person typed in <user_query>; the surrounding
@@ -102,7 +165,8 @@ def _blocks_to_text(content: Any) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, dict):
-        return content.get("text") or ""
+        text = content.get("text")
+        return text if isinstance(text, str) else ""
     if isinstance(content, list):
         return "".join(_blocks_to_text(block) for block in content)
     return ""
@@ -126,7 +190,7 @@ def read_history(
         return {"messages": [], "total": 0, "hasMore": False, "nextBefore": None}
 
     path = directory / "chat_history.jsonl"
-    if not path.is_file():
+    if not path.is_file() or path.is_symlink():
         return {"messages": [], "total": 0, "hasMore": False, "nextBefore": None}
 
     messages: list[dict[str, Any]] = []
@@ -141,6 +205,8 @@ def read_history(
                 # The agent may be mid-write on the final line; a partial record
                 # is not a reason to fail the whole request.
                 continue
+            if not isinstance(entry, dict):
+                continue
 
             kind = entry.get("type")
             if kind in _SYNTHETIC_TYPES:
@@ -152,6 +218,8 @@ def read_history(
 
             text = _blocks_to_text(entry.get("content"))
             tool_calls = entry.get("tool_calls") or []
+            if not isinstance(tool_calls, list):
+                tool_calls = []
 
             if kind == "user":
                 cleaned = _clean_user_text(text)
@@ -190,11 +258,13 @@ def read_summary(cwd: str | Path, grok_session_id: str) -> dict[str, Any]:
     if directory is None:
         return {}
     path = directory / "summary.json"
-    if not path.is_file():
+    if not path.is_file() or path.is_symlink():
         return {}
     try:
         raw = json.loads(path.read_text(encoding="utf-8", errors="replace"))
     except (json.JSONDecodeError, OSError):
+        return {}
+    if not isinstance(raw, dict):
         return {}
     return {
         "title": raw.get("session_summary") or raw.get("generated_title"),

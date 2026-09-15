@@ -169,12 +169,13 @@ private struct SessionRow: View {
                         .dsMetric()
                 }
                 Spacer(minLength: 0)
-                if session.cwdExists == false {
-                    DSChip(text: "folder missing", status: .warning)
+                if session.canRun == false {
+                    DSChip(text: session.cwdExists == false ? "folder missing" : "read-only",
+                           status: .warning)
                 }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .dsCard(session.cwdExists == false ? .warning : .idle)
+        .dsCard(session.canRun == false ? .warning : .idle)
     }
 }

@@ -1,141 +1,226 @@
 # Grok Remote
 
-Drive the `grok` CLI on your Mac from your iPhone. A small FastAPI **Bridge**
-runs a resident `grok agent stdio` process per session and speaks the
-[Agent Client Protocol](https://agentclientprotocol.com) (ACP) to it; a SwiftUI
-**iOS client** connects over a Cloudflare Tunnel and gives you a real remote
-coding surface — streamed replies, tool cards, Markdown, a project picker with
-live git status, a command palette, and full chat-history recovery.
+Grok Remote is an independent macOS Bridge and iOS client for driving the
+Grok CLI on a Mac from an iPhone. The Bridge keeps a resident ACP session per
+conversation, while the phone receives streamed messages, tool activity,
+Markdown, history, repository status, and model controls.
 
-```
-  iPhone (SwiftUI)  ──wss──►  Cloudflare Tunnel  ──►  Bridge (FastAPI, 127.0.0.1:8899)
-                                                          │  JSON-RPC / stdio
-                                                          ▼
-                                                grok agent stdio  (one per session)
-```
+This project is not affiliated with or endorsed by xAI, Grok, Cloudflare, or
+Apple. You need your own Grok CLI installation and account.
 
-## Why it is shaped this way
+## Quick start
 
-- **Resident ACP session, not `grok -p` per turn.** The Bridge keeps one
-  `grok agent stdio` process alive per session and drives it with `session/new`,
-  `session/load`, `session/prompt`, `session/cancel`. `session/load` restores a
-  session's full context across a process restart, which is what makes idle
-  reaping and effort-switch-by-restart safe.
-- **The OS sandbox is the security boundary.** ACP on grok exposes no
-  allow/deny engine and never delegates permission prompts to the client, so
-  there is no phone-side approval sheet. Instead the Bridge spawns every agent
-  under a custom Seatbelt profile (`GROK_SANDBOX=grok-remote`) that denies
-  `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.grok/auth`, keychains and `~/.config`, and
-  confines writes to the session cwd + `/tmp`. grok's sandbox is fail-open, so
-  the Bridge **fail-closes**: if the profile is not confirmed active it refuses
-  to start an agent.
-- **One credential, bound to its origin.** There is no Cloudflare Access layer;
-  authentication is a single per-device bearer token issued by pairing. The
-  token is stored in the Keychain bound to the server origin — change the host
-  and the old token is dropped, not replayed against the new address.
-- **Durable, resumable transport.** `/v2/chat` is a session-scoped WebSocket
-  backed by a per-session event journal. A phone that drops mid-turn (iOS
-  suspends backgrounded apps routinely) reconnects and replays exactly what it
-  missed via `afterSeq`; a fresh entry tails, because the transcript is loaded
-  separately from grok's own history.
+The supported first release is macOS. The installer uses Homebrew to install
+uv, cloudflared, and qrencode when they are missing. It does not install or
+authenticate the Grok CLI for you.
 
-## Repository layout
+For a stable public address, use a hostname in a Cloudflare-managed zone:
 
-```
-bridge/                 FastAPI Bridge (Python, uv-managed)
-  grok_bridge/
-    acp.py              resident ACP client: process, reader/demux, fs capability
-    protocol.py         ACP session/update  ->  Bridge event schema
-    session_manager.py  agent pool, idle reaping, event fan-out + journal
-    sandbox.py          ensure_profile() + fail-closed verify_enforced()
-    grok_disk.py        adapter over grok's private on-disk format (history, models)
-    workspace.py        repo discovery + lazy git status (worktree-aware)
-    commands.py         command registry: acp / bridge / shell kinds
-    db.py               SQLite: devices, sessions, session_events, pairing tokens
-    app.py              HTTP + WebSocket endpoints
-  tests/                unit + fake-ACP-agent integration (see below)
-  scripts/
-    smoke.py            end-to-end check against a live Bridge
-    acp_spike*.py       the Phase 0 dialect spikes (kept as evidence)
-ios/
-  GrokRemote/           SwiftUI app (Design system, Views, Markdown renderer)
-  scripts/verify.sh     design-token lint + simulator build gate
-install.sh              launchd + tunnel installer, prints a pairing QR
-```
+~~~~bash
+git clone https://github.com/v0id-byte/grok-remote.git
+cd grok-remote
+./install.sh install --hostname grok-remote.example.com
+~~~~
 
-## Running the Bridge
+For a temporary demonstration URL:
 
-```bash
+~~~~bash
+./install.sh install --quick-tunnel
+~~~~
+
+An auditable remote bootstrap is also available after the public repository is
+published:
+
+~~~~bash
+curl -fsSL https://raw.githubusercontent.com/v0id-byte/grok-remote/main/install.sh \
+  -o /tmp/grok-remote-install.sh
+bash /tmp/grok-remote-install.sh install \
+  --hostname grok-remote.example.com
+~~~~
+
+The installer will:
+
+1. Check macOS and the Grok CLI.
+2. Clone or reuse the source checkout.
+3. Install the Bridge environment with uv.
+4. Start the Bridge as a KeepAlive launchd service on 127.0.0.1:8899.
+5. Log in to Cloudflare if necessary, create or reuse the named Tunnel, and
+   create the DNS route.
+6. Start the Tunnel as a separate launchd service.
+7. Verify local and public /health endpoints.
+8. Print a one-time QR pairing payload for the iOS app.
+
+The QR payload contains the Bridge URL and a pairing token that expires after
+ten minutes. The token is exchanged once for an iPhone device credential and
+is not written to the repository.
+
+## Installer lifecycle
+
+~~~~bash
+./install.sh install --hostname grok-remote.example.com
+./install.sh install --quick-tunnel
+./install.sh doctor
+./install.sh doctor --json
+./install.sh status
+./install.sh update
+~~~~
+
+Installation is idempotent for the two Grok Remote launchd labels. It does not
+stop or rewrite unrelated Cloudflare tunnels. Runtime state is kept outside
+the checkout:
+
+- source: ~/grok-remote
+- database and uploads: ~/Library/Application Support/GrokRemote
+- logs: ~/Library/Logs/GrokRemote
+- launchd agents: ~/Library/LaunchAgents
+- named Tunnel configuration: ~/.cloudflared/grok-remote-config.yml
+
+The installer copies an existing Bridge database to the new state directory
+when one is present. It never deletes the old database.
+
+The update command refuses to operate on a dirty checkout, refreshes the source
+and Python environment, restarts the managed services, and checks local health
+before reporting success.
+
+## Cloudflare modes
+
+The default named Tunnel flow opens the Cloudflare browser login when the
+local certificate is absent, creates or reuses the Tunnel named
+grok-remote, writes an ingress mapping to the local Bridge, and creates the
+DNS route for the supplied hostname.
+
+Quick Tunnel mode is for demos only. Its hostname is temporary and can change
+after a restart, so it should not be used for a long-lived iOS pairing.
+
+The Tunnel is only a transport layer. This project deliberately does not put
+a Cloudflare Access service token in the iOS app. The Bridge's short-lived
+pairing token and per-device bearer token are the authentication boundary.
+
+## Running the Bridge manually
+
+~~~~bash
 cd bridge
 uv sync
-uv run uvicorn grok_bridge.app:app --host 127.0.0.1 --port 8899
-```
+uv run grok-remote-bridge serve --host 127.0.0.1 --port 8899
+~~~~
 
-`GET /health` reports `status`, whether the `grok` binary is reachable, and the
-auth-failure counter. The installer wires this up as a KeepAlive launchd service
-plus a dedicated Cloudflare Tunnel:
+The Bridge CLI also provides:
 
-```bash
-./install.sh grok-remote.example.com
-```
+~~~~bash
+uv run grok-remote-bridge pair-token
+uv run grok-remote-bridge doctor
+uv run grok-remote-bridge status
+~~~~
 
-It prints a one-time pairing QR (10-minute TTL) for the iOS app to scan.
+Environment variables:
 
-## API surface
+- GROK_BRIDGE_DIR: runtime database and upload directory.
+- GROK_BIN: path to the Grok executable.
+- GROK_BRIDGE_ALLOWED_ROOTS: colon-separated workspace roots.
+- GROK_BRIDGE_ALLOW_UNSANDBOXED=1: local development override only; never use
+  this for a public Tunnel.
+
+## Architecture
+
+~~~~text
+iPhone (SwiftUI)
+    | HTTPS + WebSocket through Cloudflare Tunnel
+    v
+Bridge (FastAPI, bound to 127.0.0.1:8899)
+    | one resident process per session
+    v
+grok agent stdio (ACP)
+~~~~
+
+The Bridge owns the resumable transport and event journal. The /v2/chat
+endpoint replays missed events after an iOS reconnect, while Grok's own
+on-disk history remains the source for transcript discovery.
+
+Important endpoints:
 
 | Method | Path | Purpose |
-|---|---|---|
-| POST | `/v1/pair` | redeem a pairing token → device bearer (404 when none pending) |
-| DELETE | `/v1/devices/{id}` | revoke a device (self only) |
-| GET | `/v1/sessions` | rich session list (title, model, branch, counts) |
-| POST | `/v1/sessions` | create a session for a cwd |
-| PATCH/DELETE | `/v1/sessions/{id}` | rename / delete |
-| GET | `/v1/sessions/{id}/messages` | paginated transcript from grok's history |
-| GET | `/v1/sessions/{id}/commands` | merged command list (acp / bridge-native) |
-| POST | `/v1/sessions/{id}/command` | run a bridge/shell command |
-| GET | `/v1/repos`, `POST /v1/repos/status` | repo list, then lazy git status |
-| GET | `/v1/fs/list` | directory browse (denied paths flagged, not hidden) |
-| GET | `/v1/models`, `/v1/recent-dirs` | model catalogue, recently used dirs |
-| WS | `/v2/chat` | resumable session stream (hello / afterSeq replay) |
-| WS | `/v1/chat` | legacy per-turn socket (kept until the app fully migrates) |
+| --- | --- | --- |
+| GET | /health | local health and Grok reachability |
+| POST | /v1/pair | redeem a one-time pairing token |
+| GET | /v1/sessions | Bridge and discovered Grok sessions |
+| GET | /v1/sessions/{id}/messages | transcript history |
+| GET | /v1/repos | workspace repositories |
+| WS | /v2/chat | resumable session stream |
 
-`/v2/chat` frames: `hello` → `hello.ack` (+ replay), then `prompt` / `cancel` /
-`command` / `ping` inbound and the journalled event stream outbound
-(`message.delta` / `message.thought` / `tool.*` / `message.usage` /
-`message.done` / `commands.available` / …).
+## Security boundaries and limitations
 
-## Testing
+- The Bridge listens on loopback; Cloudflare carries traffic to it.
+- Every remote request except pairing requires a per-device bearer credential.
+- Pairing tokens expire, are single-use, and are rate limited.
+- Agent processes use the grok-remote Seatbelt profile and the Bridge
+  fail-closes when enforcement is not confirmed.
+- Sensitive paths such as SSH keys, cloud credentials, keychains, and
+  configuration directories are denied by the Bridge policy.
+- The agent's own model/API HTTP traffic is not confined by the child-process
+  network setting. This project does not claim to prevent model-side
+  exfiltration.
+- Grok must read its own authentication file, so that credential is an
+  explicitly documented residual risk.
+- ACP does not provide a phone-side approval dialog. The Bridge is intended
+  for a single trusted owner and its configured workspace boundary.
+- Background APNs notifications are not implemented. The app reconnects and
+  replays missed events when it returns to the foreground.
 
-Three layers (plan v2 §5.1):
+Do not expose the Bridge with a raw port forward. Use HTTPS through the
+managed Tunnel and keep pairing codes private.
 
-```bash
+## iOS client
+
+The client targets iOS 17 and is provided as a SwiftUI Xcode project.
+
+Source build:
+
+1. Open ios/GrokRemote.xcodeproj in Xcode.
+2. Select your Apple development team for local signing.
+3. Select an iPhone or an iOS Simulator.
+4. Build and run.
+5. Scan the QR printed by the Mac installer.
+
+The repository does not contain an Apple signing identity. A developer who
+wants to distribute builds should create an App Store Connect app record for
+the bundle identifier, archive with their own team, upload the build, and
+invite testers through TestFlight. A future release can automate that upload
+after signing credentials and release ownership are deliberately configured.
+
+## Development and verification
+
+Bridge tests and package build:
+
+~~~~bash
 cd bridge
-uv run pytest                    # unit + fake-ACP-agent integration (68 tests)
-uv run python scripts/smoke.py   # end-to-end against a running Bridge
-```
+uv sync --locked
+uv run pytest -q
+uv build
+~~~~
 
-- **unit** — path/cwd validation (incl. symlink escape), the ACP→event mapping
-  against real captured frames, history parsing (partial final line,
-  `<user_query>` unwrap, env-preamble drop), auth, and DB migration.
-- **fake-ACP-agent integration** (`tests/fake_acp_agent.py`) — the reader never
-  deadlocks, the state machine refuses correctly, journal replay, crash
-  recovery, `session/load`, cancel-as-notification.
-- **real smoke** — pairing, a turn that triggers a tool, model switch, cancel
-  (`message.done{stopReason:"cancelled"}`), and `/v2/chat` resume.
+Installer static checks:
 
-iOS:
+~~~~bash
+bash -n install.sh
+./install.sh install --quick-tunnel --dry-run --source-dir "$PWD"
+~~~~
 
-```bash
-ios/scripts/verify.sh            # design-token lint, then a simulator build
-```
+iOS checks:
 
-## Notes / limitations
+~~~~bash
+ios/scripts/verify.sh lint
+ios/scripts/verify.sh build
+~~~~
 
-- **No background push yet.** In the foreground the socket is live; on return
-  from background the app reconnects and replays via `afterSeq`. A locked-phone
-  "a turn needs your attention now" notification would require APNs (an Apple
-  developer account + `.p8`); until that is configured the app does not pretend
-  to notify in the background.
-- **The sandbox confines subprocesses, not the agent's own HTTP.** Network
-  restriction covers child processes; the agent's own model/API calls are not
-  sandboxed, so this does not claim to prevent exfiltration.
+The iOS build uses a generic Simulator destination by default. Set
+GROK_REMOTE_SIMULATOR_DESTINATION when a particular local destination is
+needed.
+
+## License
+
+The project code, installer, and documentation are licensed under the Apache
+License 2.0. See LICENSE and NOTICE.
+
+The license covers this repository's original work; it does not grant rights
+to proprietary Grok/xAI services, Cloudflare services, Apple platforms, or
+their trademarks.

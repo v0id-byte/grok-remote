@@ -181,11 +181,14 @@ final class BridgeClient {
                            lastActiveAt: Date().timeIntervalSince1970,
                            lastMessagePreview: nil, model: nil, reasoningEffort: nil,
                            state: "stopped", cwdExists: true, messageCount: nil,
-                           headBranch: nil, lastTurnSummary: nil)
+                           headBranch: nil, lastTurnSummary: nil,
+                           canRun: true, readOnlyReason: nil, isNew: true)
     }
 
-    func patchSession(_ id: String, fields: [String: Any]) async throws {
-        _ = try await send(try request("v1/sessions/\(id)", method: "PATCH", body: fields))
+    func patchSession(_ id: String, fields: [String: Any]) async throws -> SessionPatchResponse {
+        try decoder.decode(
+            SessionPatchResponse.self,
+            from: try await send(try request("v1/sessions/\(id)", method: "PATCH", body: fields)))
     }
 
     func deleteSession(_ id: String) async throws {
