@@ -57,7 +57,7 @@ build() {
     CODE_SIGNING_ALLOWED=NO build \
     >/tmp/grokremote-build.log 2>&1 \
     || {
-      grep -E '(^|:)(fatal )?error:' /tmp/grokremote-build.log | tail -80 || true
+      grep -iE 'error|fatal|failed' /tmp/grokremote-build.log | tail -120 || true
       tail -30 /tmp/grokremote-build.log
       fail "xcodebuild"
     }
